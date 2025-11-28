@@ -1,5 +1,9 @@
 name: astrbot_plugin_comfyui_pro
+version: 1.1.0
 desc: AstrBot 的高级 ComfyUI 连接插件，支持多工作流热切换、LLM 智能绘图、自定义系统提示词及敏感词过滤。
 help: 安装后需在配置中填写 ComfyUI 地址。在聊天中发送 /comfy帮助 查看详细指令。
 author: lumingya
 repo: https://github.com/lumingya/astrbot_plugin_comfyui_pro
+tags:
+  - 画图
+  - comfyui
