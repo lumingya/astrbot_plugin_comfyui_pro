@@ -97,7 +97,7 @@
 ![llm演示](https://raw.githubusercontent.com/lumingya/astrbot_plugin_comfyui_pro/main/assets/draw.png)
 
 *   `/画图no <提示词>`：直接发送图片（不回复引用）。
-![llm演示](https://raw.githubusercontent.com/lumingya/astrbot_plugin_comfyui_pro/main/assets/drwano.png)
+![llm演示](https://raw.githubusercontent.com/lumingya/astrbot_plugin_comfyui_pro/main/assets/drawno.png)
 
 
 ### 方式三：管理指令 (仅管理员)
