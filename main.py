@@ -22,7 +22,7 @@ os.makedirs(img_output_dir, exist_ok=True)
 @register(
     "astrbot_plugin_comfyui_pro",  
     "lumingya",                    
-    "将astrbot与comfyui链接，提供两种指令生图，一种llm自然语言生图，以及多种配置",         
+    "ComfyUI Pro 连接器",           
     "1.1.0",                      
     "https://github.com/lumingya/astrbot_plugin_comfyui_pro" 
 )
@@ -248,7 +248,6 @@ class ComfyUIPlugin(Star):
         self.api = None
         try:
             self.api = ComfyUI(self.config) 
-            self.comfy_ui = self.api
         except Exception as e:
             logger.error(f"【初始化 ComfyUI 客户端失败】: {e}")
                 # ====== 初始化入口 ======
