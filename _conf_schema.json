@@ -1,0 +1,114 @@
+{
+  "server_address": {
+    "description": "ComfyUI 服务端 IP、端口",
+    "type": "string",
+    "hint": "请确保 ComfyUI 已启动并允许 API 访问",
+    "obvious_hint": true,
+    "default": "127.0.0.1:8188"
+  },
+  "workflow_settings": {
+    "description": "ComfyUI 工作流节点配置",
+    "type": "object",
+    "items": {
+      "json_file": {
+        "description": "工作流文件名 (自动扫描 workflow 目录)",
+        "type": "string",
+        "default": "workflow_api.json",
+        "options": [
+          "workflow_api.json"
+        ],
+        "enum": [
+          "workflow_api.json"
+        ]
+      },
+      "input_node_id": {
+        "description": "输入提示词的节点 ID (Prompt)",
+        "type": "string",
+        "hint": "通常是 CLIP Text Encode 节点的 ID",
+        "default": "6",
+        "obvious_hint": true
+      },
+      "seed_node_id": {
+        "description": "随机种子节点 ID (Seed)",
+        "type": "string",
+        "hint": "通常是 KSampler 或 Seed 节点的 ID",
+        "default": "3"
+      },
+      "output_node_id": {
+        "description": "图片输出节点 ID (Image)",
+        "type": "string",
+        "hint": "留空则自动寻找第一个包含图片的输出节点",
+        "default": ""
+      }
+    }
+  },
+  "llm_settings": {
+    "description": "大语言模型(LLM)相关配置",
+    "type": "object",
+    "items": {
+      "system_prompt": {
+        "description": "ComfyUI 绘图工具的系统提示词",
+        "type": "text",
+        "hint": "定义 LLM 应该如何处理用户的画图请求，以及输出格式。必须包含对【提示词是：xxx】格式的强调，否则无法触发自动画图。",
+        "default": "<image_generation>\n【前言】此工具用于根据用户的自然语言请求，在 ComfyUI 生成 AI 图像 prompt。你必须扮演一个专业的\"提示词工程师\"，严格执行以下流程。\n\n**核心任务 (Core Task):**\n\n1.  **解析与翻译 (Parse & Translate)**: 首先，你必须仔细阅读并理解用户的自然语言请求（无论何种语言）。你的首要任务是将其**翻译**成英文，并识别出其中最核心的**主体、动作、和场景**。\n\n2.  **精炼与重构 (Refine & Reconstruct)**: 你必须**清洗**翻译后的文本，**删除所有不必要的、冗余的动词和形容词**。只保留构成画面的核心要素（主谓宾结构），将其重构成一个简洁的、以逗号分隔的英文关键词列表。\n\n**全局原则 (Global Principles):**\n- **G0 (关键词思维)**: 【绝对禁止】输出任何形式的句子或描述性短语。\n- **G1 (镜头选择)**: 【禁止】滥用`close-up`。只有在用户的明确要求使用特写才可以使用。在大多数情况下，优先选择 `cowboy shot` 或 `upper body` 以获得更好的构图。\n- **G2 (权重)**: 权重只允许 `(word:value)` 形式，常规 `1.2`，核心焦点 `1.35`。\n- **G3 (黑名单)**: 禁止词：`pale skin`, `full body`, `wide shot`。\n⚠️ 整行只有一个换行符，就是最后的回车。所有关键词用英文逗号分隔，保证同一角色时请把 same_* 系列关键词保留。\n提示词是: SFW, (1girl:1.2), {CharacterName}, same_face, same_eyes, same_hair, same_outfit, {action}, {camera}, {environment}, masterpiece, best quality\n• 核心位解释\n\n    {CharacterName} → 角色名或 IP 名称\n    same_face/eyes/hair/outfit → 强化“前后图一致”\n    {action} → 1-3 个动作或姿势关键词\n    {camera} → upper body / cowboy shot / close-up(只有用户点名)\n    {environment} → 背景 & 光照\n\n---\n**构建流程 (Build Process):**\n\n**P1-评级 (Rating)**: 根据用户请求判断 `SFW` / `NSFW`。\n**P2-主体 (Subjects)**: 明确主体数量 (不超过2)，并用`(word:1.2)`加权。\n**P3-角色 (Character)**: \n    - **IF** 角色是已知IP人物，使用名字。\n    - **IF** 角色是原创，提炼核心外貌。\n    - **IF** 包含用户，抽象为 `1boy/1man`。\n**P4-服装 (Outfit)**: 提炼服装描述，或使用 `nude, topless`。\n**P5-镜头与焦点 (Camera & Focus)**: 根据你的\"智能构图\"判断，选择一个视角和一个焦点。\n**P6-核心动作与表情 (Action & Expression)**: 提炼1-3个最核心的静态姿势和表情。\n**P7-环境与光线 (Environment & Lighting)**: 提炼一个环境和一个光线。\n**P8-风格与质量 (Style & Quality)**: 如用户提及，添加风格词；否则默认添加 `masterpiece, best quality`。\n\n---\n**输出要求 (Output Mandate - 必须同时执行):**\n\n1.  **【For ComfyUI】**: 你【必须】将最终生成的、经过你专业整理的英文关键词列表，作为 `prompt` 参数的值，传递给ComfyUI工具。\n2.  **【For User】**: 你【必须】在你的对话回复中，明确地、一字不差地告诉用户你最终使用的提示词是什么。\n\n**严格按照标准回复格式示例:必须有1.使用的提示词是什么？2.用户的输入是否完备，是否需要补充？请自我询问。**\n\n用户：画一个画一个芙宁娜坐在野炊布上，歪着头看向我。\nyou：提示词是：SFW, (1girl:1.2), Furina, sitting on picnic blanket, head tilt, looking at viewer, outdoor, picnic, daylight, masterpiece, best quality。\n你的表述已经完备，所以我没有修改，也就是芙宁娜坐在野炊布上，歪着头看向你。\n</image_generation>"
+      }
+    }
+  },
+  "control": {
+    "description": "访问和安全控制",
+    "type": "object",
+    "items": {
+      "cooldown_seconds": {
+        "description": "用户命令冷却时间（秒）",
+        "type": "int",
+        "default": 35
+      },
+      "admin_ids": {
+        "description": "管理员 QQ 号（列表）",
+        "type": "list",
+        "default": []
+      },
+      "whitelist_group_ids": {
+        "description": "允许使用的群（白名单）",
+        "type": "list",
+        "default": []
+      },
+      "default_group_policy": {
+        "description": "白名单群默认敏感词策略 [none/lite/full]",
+        "type": "string",
+        "default": "lite"
+      },
+      "default_private_policy": {
+        "description": "私聊默认敏感词策略 [none/lite/full]",
+        "type": "string",
+        "default": "lite"
+      },
+      "lockdown": {
+        "description": "全局锁定 (仅管理员可用)",
+        "type": "bool",
+        "default": false
+      },
+      "admin_bypass": {
+        "description": "管理员特权设置",
+        "type": "object",
+        "items": {
+          "whitelist": {
+            "description": "管理员无视群聊白名单",
+            "type": "bool",
+            "default": true
+          },
+          "cooldown": {
+            "description": "管理员无视冷却时间",
+            "type": "bool",
+            "default": true
+          },
+          "sensitive_words": {
+            "description": "管理员无视敏感词过滤",
+            "type": "bool",
+            "default": true
+          }
+        }
+      }
+    }
+  }
+}
