@@ -85,9 +85,12 @@
 
 ### 方式二：直接指令
 *   `/画图 <提示词>`: 以合并转发的方式发送图片。
+*   
+![指令演示](https://raw.githubusercontent.com/lumingya/astrbot_plugin_comfyui_pro/main/assets/draw.png)
+
 *   `/画图no <提示词>`: 直接发送图片，更简洁。
 
-![指令演示](https://raw.githubusercontent.com/lumingya/astrbot_plugin_comfyui_pro/main/assets/draw.png)
+![指令演示](https://raw.githubusercontent.com/lumingya/astrbot_plugin_comfyui_pro/main/assets/drawno.png)
 
 ### 方式三：管理指令 (仅管理员)
 *   `/comfy_ls`: 列出所有可用的工作流，并显示序号。
