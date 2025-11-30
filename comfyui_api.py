@@ -22,8 +22,10 @@ class ComfyUI:
         wf_conf = config.get("workflow_settings", {})
         self.wf_filename = wf_conf.get("json_file", "workflow_api.json")
         self.input_id = str(wf_conf.get("input_node_id", "6"))
-        self.seed_id = str(wf_conf.get("seed_node_id", "31"))
-        self.output_id = str(wf_conf.get("output_node_id", "9")) 
+        self.output_id = str(wf_conf.get("output_node_id", "9"))
+
+        # 种子节点配置已废弃，不再使用
+        self.seed_id = None
 
         # 路径处理
         self.current_dir = os.path.dirname(os.path.abspath(__file__)) # 保存这个路径方便后续拼接
@@ -32,21 +34,23 @@ class ComfyUI:
         logger.info(f"ComfyUI API 已加载 | 工作流: {self.wf_filename}")
 
     # ====== 新增：热重载配置的方法 ======
-    def reload_config(self, filename: str, input_id: str = None, output_id: str = None, seed_id: str = None):
+    def reload_config(self, filename: str, input_id: str = None, output_id: str = None):
         """动态切换工作流，无需重启"""
         self.wf_filename = filename
         self.workflow_path = os.path.join(self.current_dir, 'workflow', filename)
-        
-        # 只有当传入了新的 ID 时才更新，否则保持原样
-        if input_id: self.input_id = str(input_id)
-        if output_id: self.output_id = str(output_id)
-        if seed_id: self.seed_id = str(seed_id) # 保留对 seed_id 的支持，但不作为指令参数
-        
-        # 验证文件是否存在
+
+        if input_id:
+            self.input_id = str(input_id)
+        if output_id:
+            self.output_id = str(output_id)
+
         exists = os.path.exists(self.workflow_path)
         status = "存在" if exists else "不存在(请检查文件名)"
-        
-        logger.info(f"[ComfyUI] 切换工作流 -> {filename} [{status}] | Input:{self.input_id} Output:{self.output_id or '自动'} Seed:{self.seed_id}")
+
+        logger.info(
+            f"[ComfyUI] 切换工作流 -> {filename} [{status}] | Input:{self.input_id} "
+            f"Output:{self.output_id or '自动'}"
+        )
         return exists, f"已切换至 {filename}，文件{status}。\n当前节点设置: Input={self.input_id}, Output={self.output_id or '自动'}"
     # =================================
 
@@ -57,47 +61,58 @@ class ComfyUI:
             return json.load(f)
 
     def _inject_params(self, workflow, prompt):
-        """智能注入参数"""
+        """最简版参数注入：写提示词 + 强制改所有 seed/noise_seed"""
         # 1. 注入正向提示词
         node = workflow.get(self.input_id)
         if not node:
             logger.error(f"严重错误: 找不到输入节点 ID {self.input_id}，请检查工作流或配置。")
-            return # 防止直接崩掉，打印日志
+            return
 
         inputs = node.get("inputs", {})
-        # 暴力匹配常见的文本 key
-        target_keys = ["text", "opt_text", "string", "text_positive", "positive", "prompt", "wildcard_text"]
-        injected = False
+        target_keys = [
+            "text", "opt_text", "string",
+            "text_positive", "positive",
+            "prompt", "wildcard_text",
+        ]
         for key in target_keys:
             if key in inputs:
                 inputs[key] = prompt
-                injected = True
                 break
-        
-            # 2. 注入随机种子
-        if self.seed_id and self.seed_id in workflow:
-            s_node = workflow[self.seed_id].get("inputs", {})
-            seed_val = random.randint(1, 999999999999999)
-            
-            # === 兼容性修改开始 ===
-            # 情况A：如果是标准采样器 (KSampler)，它一定有 seed 或 noise_seed
-            if "seed" in s_node: 
-                s_node["seed"] = seed_val
-            elif "noise_seed" in s_node: 
-                s_node["noise_seed"] = seed_val
-            
-            # 情况B：如果是数值节点，且本来就有 value 键
-            elif "value" in s_node: 
-                s_node["value"] = seed_val
-            
-            # 情况C：如果上面都没有，强制添加 value 键
-            # 这种自定义节点通常需要 value 参数，但 JSON 里可能缺省
-            else:
-                s_node["value"] = seed_val
-            # === 兼容性修改结束 ===
 
-            logger.info(f"已向节点 [{self.seed_id}] 注入随机种子: {seed_val}")
+        # 2. 为本次请求生成一个“基础随机种子”
+        base_seed = random.randint(1, 999999999999999)
 
+        # 3. 遍历整个 workflow，把所有含有 seed / noise_seed 的输入都改掉
+        ks_count = 0
+        offset = 0
+
+        for nid, node_data in workflow.items():
+            if not isinstance(node_data, dict):
+                continue
+            n_inputs = node_data.get("inputs", {})
+            if not isinstance(n_inputs, dict):
+                continue
+
+            changed = False
+
+            # 如果有 seed 字段，就写一个基于 base_seed 的值
+            if "seed" in n_inputs:
+                n_inputs["seed"] = base_seed + offset
+                offset += 1
+                changed = True
+
+            # 如果有 noise_seed 字段，同样处理
+            if "noise_seed" in n_inputs:
+                n_inputs["noise_seed"] = base_seed + offset
+                offset += 1
+                changed = True
+
+            if changed:
+                ks_count += 1
+
+        logger.info(
+            f"[ComfyUI] 本次基础随机种: {base_seed}，已写入 {ks_count} 个 seed/noise_seed 输入"
+        )
 
     async def generate(self, prompt):
         """异步生成图片"""
