@@ -22,7 +22,7 @@ os.makedirs(img_output_dir, exist_ok=True)
     "astrbot_plugin_comfyui_pro",  
     "lumingya",                    
     "ComfyUI Pro 连接器",           
-    "1.1.0",                      
+    "1.2.1",                      
     "https://github.com/lumingya/astrbot_plugin_comfyui_pro" 
 )
 class ComfyUIPlugin(Star):
