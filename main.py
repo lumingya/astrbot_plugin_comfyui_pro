@@ -2,27 +2,33 @@ import os
 import uuid
 import time
 import re
-import base64
 import traceback
 import json
+import shutil
+from pathlib import Path
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import *
-from .comfyui_api import ComfyUI
 from astrbot.api import llm_tool, logger
+from astrbot.api.provider import LLMResponse
 
-# 获取当前文件的绝对路径
-current_file_path = os.path.abspath(__file__)
-# 获取当前文件所在目录的绝对路径
-current_directory = os.path.dirname(current_file_path)
-# 图片生成存放目录
-img_output_dir = os.path.join(current_directory, 'output')
-os.makedirs(img_output_dir, exist_ok=True)
+# 尝试导入 StarTools（兼容不同版本）
+try:
+    from astrbot.api.star import StarTools
+    HAS_STAR_TOOLS = True
+except ImportError:
+    HAS_STAR_TOOLS = False
+    logger.warning("[ComfyUI] 无法导入 StarTools，将使用备用目录方案")
+
+# 获取插件目录（用于读取默认文件）
+PLUGIN_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+
+
 @register(
     "astrbot_plugin_comfyui_pro",  
     "lumingya",                    
     "ComfyUI Pro 连接器",           
-    "1.2.1",                      
+    "1.2.0",
     "https://github.com/lumingya/astrbot_plugin_comfyui_pro" 
 )
 class ComfyUIPlugin(Star):
@@ -30,7 +36,19 @@ class ComfyUIPlugin(Star):
         super().__init__(context)
         self.config = config
         
-        # 1. 正常读取其他配置
+        # ====== 1. 获取持久化数据目录 ======
+        self.data_dir = self._get_persistent_dir()
+        logger.info(f"[ComfyUI] 📂 数据目录: {self.data_dir}")
+        
+        # ====== 2. 初始化目录结构 ======
+        self._init_data_directories()
+        
+        # ====== 3. 设置路径变量 ======
+        self.workflow_dir = self.data_dir / "workflow"
+        self.output_dir = self.data_dir / "output"
+        self.sensitive_words_path = self.data_dir / "sensitive_words.json"
+        
+        # ====== 4. 更新 UI 配置 ======
         self._auto_update_schema()
         
         # Control 配置
@@ -60,15 +78,21 @@ class ComfyUIPlugin(Star):
         self.admin_bypass_cooldown = bypass.get("cooldown", True)
         self.admin_bypass_sensitive = bypass.get("sensitive_words", True)
 
-        logger.info(f"[ComfyUIPlugin] 载入配置的白名单群: {self.whitelist_group_ids}")
+        # 日志：显示管理员和白名单配置
+        admin_count = len(self.admin_user_ids)
+        group_count = len(self.whitelist_group_ids)
+        logger.info(f"[ComfyUI] 👤 管理员: {admin_count} 个 | 🏠 白名单群: {group_count} 个")
+        if self.lockdown:
+            logger.warning("[ComfyUI]⚠️ 全局锁定已启用，仅管理员可用")
 
         # 加载敏感词
         self.lexicon = {}
         try:
-            lexicon_path = os.path.join(current_directory, "sensitive_words.json")
-            if os.path.exists(lexicon_path):
-                with open(lexicon_path, "r", encoding="utf-8") as f:
+            if self.sensitive_words_path.exists():
+                with open(self.sensitive_words_path, "r", encoding="utf-8") as f:
                     self.lexicon = json.load(f)
+                word_count = sum(len(v) for v in self.lexicon.values() if isinstance(v, list))
+                logger.info(f"[ComfyUI] 🔒 敏感词库已加载: {word_count} 个词条")
             else:
                 self.lexicon = {"legacy_lite": [], "full": []} 
         except Exception:
@@ -77,294 +101,427 @@ class ComfyUIPlugin(Star):
         self._policy_patterns = {}
         self._build_policy_patterns()
         
+        # 初始化 ComfyUI API
         self.comfy_ui = None
         self.api = None
         try:
-            self.api = ComfyUI(self.config) 
+            from .comfyui_api import ComfyUI
+            self.api = ComfyUI(self.config, data_dir=self.data_dir)
+            logger.info(f"[ComfyUI] ✅ ComfyUI API 初始化成功")
         except Exception as e:
-            logger.error(f"【初始化 ComfyUI 客户端失败】: {e}")
+            logger.error(f"[ComfyUI] ❌ ComfyUI API 初始化失败: {e}")
+            logger.error(traceback.format_exc())
+
+    # ====== 获取持久化目录 ======
+    def _get_persistent_dir(self) -> Path:
+        """获取插件的持久化数据目录"""
+        data_path = None
+        
+        if HAS_STAR_TOOLS:
+            try:
+                data_path = StarTools.get_data_dir(self)
+            except Exception:
+                try:
+                    data_path = StarTools.get_data_dir()
+                except Exception:
+                    try:
+                        data_path = StarTools.get_data_dir(self.context)
+                    except Exception:
+                        pass
+        
+        if data_path is None:
+            current = Path.cwd()
+            data_path = current / "data" / "plugin_data" / "astrbot_plugin_comfyui_pro"
+        
+        if not isinstance(data_path, Path):
+            data_path = Path(data_path)
+        
+        data_path.mkdir(parents=True, exist_ok=True)
+        return data_path
+
+    # ====== 初始化目录结构 ======
+    def _init_data_directories(self):
+        """初始化持久化目录，首次安装时复制默认文件"""
+        workflow_dir = self.data_dir / "workflow"
+        output_dir = self.data_dir / "output"
+        
+        workflow_dir.mkdir(exist_ok=True)
+        output_dir.mkdir(exist_ok=True)
+        
+        # 复制默认工作流
+        plugin_workflow_dir = PLUGIN_DIR / "workflow"
+        copied_count = 0
+        if plugin_workflow_dir.exists():
+            for src_file in plugin_workflow_dir.glob("*.json"):
+                dst_file = workflow_dir / src_file.name
+                if not dst_file.exists():
+                    try:
+                        shutil.copy2(src_file, dst_file)
+                        copied_count += 1
+                    except Exception as e:
+                        logger.error(f"[ComfyUI] 复制工作流失败 {src_file.name}: {e}")
+        
+        if copied_count > 0:
+            logger.info(f"[ComfyUI] 📋 已复制 {copied_count} 个默认工作流")
+        
+        # 复制默认敏感词文件
+        sensitive_dst = self.data_dir / "sensitive_words.json"
+        sensitive_src = PLUGIN_DIR / "sensitive_words.json"
+        if not sensitive_dst.exists() and sensitive_src.exists():
+            try:
+                shutil.copy2(sensitive_src, sensitive_dst)
+                logger.info(f"[ComfyUI] 📋 已复制默认敏感词文件")
+            except Exception as e:
+                logger.error(f"[ComfyUI] 复制敏感词文件失败: {e}")
+
+    # ====== 更新 Schema ======
+    def _auto_update_schema(self):
+        """扫描持久化目录的工作流，更新 UI 下拉列表"""
+        try:
+            schema_path = PLUGIN_DIR / '_conf_schema.json'
+            workflow_dir = self.data_dir / 'workflow'
+
+            if not workflow_dir.exists():
+                return
+
+            files = sorted([f.name for f in workflow_dir.glob("*.json")])
+            if not files:
+                files = ["workflow_api.json"]
+
+            with open(schema_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            target = data['workflow_settings']['items']['json_file']
+            target['options'] = files
+            target['enum'] = files
+            
+            with open(schema_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"[ComfyUI] 🔄 工作流列表已更新: {len(files)} 个可用")
+
+        except Exception as e:
+            logger.error(f"[ComfyUI] 更新工作流列表失败: {e}")
+
+    # ====== 权限检查（返回原因）======
+    def _check_access(self, event: AstrMessageEvent) -> tuple:
+        """
+        统一的权限检查，返回 (是否通过, 拒绝原因)
+        """
+        user_id = str(event.get_sender_id())
+        is_admin = user_id in self.admin_user_ids
+        
+        # 1. 全局锁定检查
+        if self.lockdown and not is_admin:
+            return False, "🔒 全局锁定中，仅管理员可用"
+        
+        # 2. 群聊白名单检查
+        if self._is_group_message(event):
+            gid = self._get_group_id(event)
+            if not gid:
+                return False, "⚠️ 无法获取群号"
+            
+            # 检查白名单
+            if gid not in self.whitelist_group_ids:
+                # 管理员可以绕过
+                if is_admin and self.admin_bypass_whitelist:
+                    pass  # 放行
+                else:
+                    return False, f"🚫 本群({gid})不在白名单中"
+        
+        return True, ""
+
+    def _check_cooldown(self, event: AstrMessageEvent) -> tuple:
+        """
+        冷却检查，返回 (是否通过, 剩余秒数或0)
+        """
+        user_id = str(event.get_sender_id())
+        is_admin = user_id in self.admin_user_ids
+        
+        # 管理员绕过冷却
+        if is_admin and self.admin_bypass_cooldown:
+            return True, 0
+        
+        current_time = time.time()
+        last_time = self.user_cooldowns.get(user_id, 0)
+        elapsed = current_time - last_time
+
+        if elapsed < self.cooldown_seconds:
+            remain = int(self.cooldown_seconds - elapsed)
+            return False, remain
+
+        self.user_cooldowns[user_id] = current_time
+        return True, 0
+
+    def _check_sensitive(self, prompt: str, event: AstrMessageEvent) -> tuple:
+        """
+        敏感词检查，返回 (是否通过, 触发的敏感词列表)
+        """
+        user_id = str(event.get_sender_id())
+        is_admin = user_id in self.admin_user_ids
+        
+        sensitive = self._find_sensitive_words(prompt, event)
+        
+        if not sensitive:
+            return True, []
+        
+        # 管理员绕过
+        if is_admin and self.admin_bypass_sensitive:
+            logger.info(f"[ComfyUI] 👑 管理员 {user_id} 使用敏感词 {sensitive}，已放行")
+            return True, []
+        
+        return False, sensitive
+
     @filter.on_llm_request()
     async def inject_system_prompt(self, event: AstrMessageEvent, req):
-        """
-        在 LLM 请求发送前，从 config['llm_settings'] 读取并注入提示词。
-        """
+        """注入系统提示词"""
         try:
-            # 【调试日志】确认函数被触发
-            # logger.info(f"[ComfyUI] 拦截到 LLM 请求，准备注入提示词...")
-
-            
             llm_settings = self.config.get("llm_settings", {}) 
             my_prompt = llm_settings.get("system_prompt", "")
 
-            # 如果没配置或为空，打印警告并返回
             if not my_prompt:
-                logger.warning("[ComfyUI] 配置中 system_prompt 为空，跳过注入。")
                 return
 
-            # 2. 标准注入逻辑 (只修改 system_prompt 字段)
-            # 获取当前已有的 system_prompt (防止报错用 getattr)
             current_prompt = getattr(req, "system_prompt", "") or ""
 
-            # 简单去重：如果已经包含该提示词，就不再添加
             if my_prompt in current_prompt:
-                # logger.info("[ComfyUI] 提示词已存在，跳过重复注入")
                 return
 
-            # 3. 追加拼接
             if current_prompt:
                 req.system_prompt = f"{current_prompt}\n\n{my_prompt}".strip()
             else:
                 req.system_prompt = my_prompt.strip()
 
-            logger.info(f"[ComfyUI] 系统提示词注入成功 (长度: {len(my_prompt)})")
-
         except Exception as e:
             logger.error(f"[ComfyUI] 注入提示词异常: {e}")
-            logger.error(traceback.format_exc())
 
-    # ====== 初始化入口 ======
     async def initialize(self):
-        # 这里只做初始化操作
         self.context.activate_llm_tool("comfyui_txt2img")
+        logger.info("[ComfyUI] 🎨 插件初始化完成，LLM 工具已激活")
 
-    def _auto_update_schema(self):
-        """[调试版] 启动时扫描 workflow 目录，强制更新 UI"""
-        try:
-            # 1. 确定路径
-            base_path = os.path.dirname(os.path.abspath(__file__))
-            schema_path = os.path.join(base_path, '_conf_schema.json')
-            workflow_dir = os.path.join(base_path, 'workflow')
-            
-            logger.info(f"[ComfyUI] 正在检查工作流目录: {workflow_dir}")
-
-            # 2. 扫描文件
-            if not os.path.exists(workflow_dir):
-                logger.error(f"[ComfyUI] 目录不存在: {workflow_dir}")
-                return
-
-            files = [f for f in os.listdir(workflow_dir) if f.endswith('.json')]
-
-            if not files:
-                files = ["workflow_api.json"] # 兜底
-
-            # 3. 读取并修改 JSON
-            with open(schema_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            # 直接定位，不再用 get，强制修改
-            # 路径: workflow_settings -> items -> json_file
-            target = data['workflow_settings']['items']['json_file']
-            
-            # 强制覆盖旧配置
-            target['options'] = sorted(files)
-            target['enum'] = sorted(files) # 双重保险
-            
-            # 4. 写回文件
-            with open(schema_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            
-            logger.info(f"[ComfyUI] 配置文件已更新! 写入列表: {files}")
-            logger.info(f"[ComfyUI] 请按照教程重载-刷新-重载以加载新选项")
-
-        except Exception as e:
-            # 把错误完整打印出来
-            logger.error(f"[ComfyUI] 更新 UI 失败，报错信息如下:")
-            logger.error(traceback.format_exc())
-
-    # ====== 核心绘图逻辑 (从 initialize 里移出来的) ======
+    # ====== 核心绘图逻辑 ======
     async def _handle_paint_logic(self, event: AstrMessageEvent, direct_send: bool):
-        """这是处理画图的核心逻辑"""
-        if self._is_locked_for(event):
-            yield event.plain_result("全局锁定。")
+        """处理画图的核心逻辑"""
+        # 权限检查
+        allowed, reason = self._check_access(event)
+        if not allowed:
+            yield event.plain_result(reason)
             return
+        
         try:
-            logger.info(f"进入核心绘图逻辑, direct_send={direct_send}, full_message='{event.message_str}'")
-            
             full_message = event.message_str.strip()
             parts = full_message.split(' ', 1)
             prompt = parts[1].strip() if len(parts) > 1 else ""
 
             if not prompt:
-                yield event.plain_result("请输入提示词。")
+                yield event.plain_result("❌ 请输入提示词，例如：/画图 1girl, smile")
                 return
 
-            if prompt:
-                user_id = str(event.get_sender_id())
-                is_admin = user_id in self.admin_user_ids
-                can_bypass_sensitive = is_admin and self.admin_bypass_sensitive
-                sensitive = self._find_sensitive_words(prompt, event)
-                if sensitive and not can_bypass_sensitive:
-                    tip = "、".join(sensitive)
-                    logger.warning(f"用户 {user_id} 违禁: {tip}")
-                    yield event.plain_result(f"检测到敏感词：{tip}，无法生成图片。")
-                    return
-                elif sensitive and can_bypass_sensitive:
-                    logger.info(f"管理员 {user_id} 使用敏感词 {sensitive}，已放行。")
+            # 敏感词检查
+            passed, sensitive = self._check_sensitive(prompt, event)
+            if not passed:
+                tip = "、".join(sensitive[:5])  # 最多显示5个
+                extra = f"等 {len(sensitive)} 个" if len(sensitive) > 5 else ""
+                yield event.plain_result(f"🚫 检测到敏感词：{tip}{extra}，无法生成图片")
+                return
 
-            # 调用绘图工具
             async for result in self.comfyui_txt2img(event, prompt=prompt, direct_send=direct_send):
                 yield result
+                
         except Exception as e:
-            logger.error(f"画图插件发生未知错误: {e}")
+            logger.error(f"[ComfyUI] 绘图异常: {e}")
             logger.error(traceback.format_exc())
-            yield event.plain_result("执行画图命令时出错，请查看后台日志。")
-    # ====== 指令函数 (全部移到类的一级缩进下，并添加 self) ======
+            yield event.plain_result(f"❌ 执行出错：{str(e)[:50]}")
 
     @filter.command("comfy帮助")
     async def cmd_comfyui_help(self, event: AstrMessageEvent):
-        if self._is_group_message(event) and not self._is_group_allowed(event):
-            yield event.plain_result(f"禁止输入。")
+        allowed, reason = self._check_access(event)
+        if not allowed:
+            yield event.plain_result(reason)
             return
+        
         gid = self._get_group_id(event)
         policy = self._get_policy_for_event(event)
-        tips = [
-            "🎨 ComfyUI 插件帮助",
-            "━━━━━━━━━━━━━━",
-            "【基础指令】",
-            "  • /画图 <提示词>    → 生成图片（转发模式）",
-            "  • /画图no <提示词> → 生成图片（直发模式）",
-            "  • LLM 对话模式       → '帮我画一个...'",
-            ""
-        ]
         user_id = str(event.get_sender_id())
         is_admin = user_id in self.admin_user_ids
-        # ==================
-        # 只有管理员才显示高级指令
+        
+        tips = [
+            "🎨 ComfyUI Pro 插件帮助",
+            "━━━━━━━━━━━━━━━━━━",
+            "",
+            "【基础指令】",
+            "  /画图 <提示词>     生成图片（转发模式）",
+            "  /画图no <提示词>   生成图片（直发模式）",
+            "  /comfy帮助         显示此帮助",
+            "",
+            "【LLM 模式】",
+            "  直接对话：'帮我画一个可爱的猫娘'",
+            ""
+        ]
+        
         if is_admin:
             tips.extend([
-                "【工作流管理 (管理员)】",
-                "  • /comfy_ls               → 列出所有工作流",
-                "  • /comfy_use <文件id><输入节点id><输出节点id> → 切换工作流",
-                "  • /comfy_save <文件名> <JSON> → 导入新工作流",
-                "",
-                "【控制指令】",
-                "  • /违禁级别 [none|lite|full] → 设置群敏感度",
+                "【管理员指令】 👑",
+                "  /comfy_ls          列出所有工作流",
+                "  /comfy_use <序号>  切换工作流",
+                "  /comfy_save        导入新工作流",
+                "  /违禁级别          设置群敏感度",
+                ""
             ])
-            
-        tips.append("━━━━━━━━━━━━━━")
-        tips.append(f"📌 当前违禁级别：{policy}" + (f" (群 {gid})" if gid else " (私聊)"))
+        
+        # 状态信息
+        tips.append("━━━━━━━━━━━━━━━━━━")
+        tips.append(f"📍 当前位置：{'群聊 ' + gid if gid else '私聊'}")
+        tips.append(f"🔒 违禁级别：{policy}")
+        tips.append(f"⏱️ 冷却时间：{self.cooldown_seconds} 秒")
+        if is_admin:
+            tips.append(f"👑 身份：管理员")
+            tips.append(f"📂 数据目录：{self.data_dir}")
+        
         yield event.plain_result("\n".join(tips))
 
     @filter.command("违禁级别", aliases={"banlevel", "敏感级别"})
     async def cmd_set_policy(self, event: AstrMessageEvent):
-        if self._is_locked_for(event):
-            yield event.plain_result("全局锁定。")
+        allowed, reason = self._check_access(event)
+        if not allowed:
+            yield event.plain_result(reason)
             return
+        
         if not self._is_group_message(event):
-            yield event.plain_result("该指令仅支持群聊使用。")
+            yield event.plain_result("⚠️ 该指令仅支持在群聊中使用")
             return
-        if not self._is_group_allowed(event):
-            yield event.plain_result(f"禁止输入。")
+
+        # 检查管理员权限
+        user_id = str(event.get_sender_id())
+        if user_id not in self.admin_user_ids:
+            yield event.plain_result("🚫 权限不足，仅管理员可修改违禁级别")
             return
 
         full_msg = event.message_str.strip()
         parts = full_msg.split()
-        gid = self._get_group_id(event) or "未知群"
+        gid = self._get_group_id(event) or "未知"
 
         if len(parts) == 1:
             current = self.group_policies.get(gid, self.default_group_policy)
-            yield event.plain_result(f"本群当前违禁级别：{current}（可选：none / lite / full）")
+            yield event.plain_result(
+                f"📊 本群当前违禁级别：{current}\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"可选级别：\n"
+                f"  none - 不过滤\n"
+                f"  lite - 轻度过滤\n"
+                f"  full - 完全过滤\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"用法：/违禁级别 <级别>"
+            )
             return
 
         level = parts[1].lower()
         if level not in self.policies:
-            yield event.plain_result("用法：/违禁级别 [none|lite|full]")
+            yield event.plain_result("❌ 无效级别，可选：none / lite / full")
             return
 
         self.group_policies[gid] = level
-        yield event.plain_result(f"已将本群违禁级别设置为：{level}")
-    # ====== 新增：工作流管理指令 ======
+        logger.info(f"[ComfyUI] 群 {gid} 违禁级别已设为 {level}（操作者：{user_id}）")
+        yield event.plain_result(f"✅ 已将本群违禁级别设置为：{level}")
 
     @filter.command("comfy_ls")
     async def cmd_comfy_list(self, event: AstrMessageEvent):
         """列出当前所有可用工作流"""
-        # 权限校验
-        if not self._check_permission(event): 
-            yield event.plain_result("权限不足。")
+        user_id = str(event.get_sender_id())
+        if user_id not in self.admin_user_ids:
+            yield event.plain_result("🚫 权限不足，仅管理员可查看工作流列表")
             return
 
-        workflow_dir = os.path.join(current_directory, 'workflow')
-        if not os.path.exists(workflow_dir):
-            yield event.plain_result("错误：workflow 目录不存在。")
+        if not self.workflow_dir.exists():
+            yield event.plain_result("❌ 工作流目录不存在")
             return
 
-        files = sorted([f for f in os.listdir(workflow_dir) if f.endswith('.json')])
+        files = sorted([f.name for f in self.workflow_dir.glob("*.json")])
         if not files:
-            yield event.plain_result("目录中没有 .json 文件。")
+            yield event.plain_result("📂 目录中没有工作流文件")
             return
 
         current_file = self.api.wf_filename if self.api else "未知"
         
-        msg = ["📂 可用工作流列表："]
+        msg = ["📂 可用工作流列表", "━━━━━━━━━━━━━━━━━━"]
         for i, f in enumerate(files, 1):
-            mark = "✅ " if f == current_file else "   "
-            msg.append(f"{mark}{i}. {f}")
+            if f == current_file:
+                msg.append(f"✅ {i}. {f} (当前)")
+            else:
+                msg.append(f"   {i}. {f}")
         
         msg.append("")
-        msg.append("切换指令：/comfy_use <序号> [input_id] [output_id]")
+        msg.append("━━━━━━━━━━━━━━━━━━")
+        msg.append("切换：/comfy_use <序号> [正面ID] [负面ID] [输出ID]")
         yield event.plain_result("\n".join(msg))
 
     @filter.command("comfy_use")
     async def cmd_comfy_use(self, event: AstrMessageEvent):
-        """切换工作流
-        用法: /comfy_use <序号> [input_id] [output_id]
-        """
-        if not self._check_permission(event):
-            yield event.plain_result("权限不足。")
+        """切换工作流"""
+        user_id = str(event.get_sender_id())
+        if user_id not in self.admin_user_ids:
+            yield event.plain_result("🚫 权限不足，仅管理员可切换工作流")
             return
 
         args = event.message_str.split()
         if len(args) < 2:
-            yield event.plain_result("参数错误。\n用法: /comfy_use <序号> [input_id] [output_id]")
+            yield event.plain_result(
+                "❌ 参数不足\n"
+                "用法：/comfy_use <序号> [正面ID] [负面ID] [输出ID]\n"
+                "示例：/comfy_use 1 6 7 9"
+            )
             return
 
-        # --- 核心修改：通过序号选择文件 ---
         try:
-            workflow_dir = os.path.join(current_directory, 'workflow')
-            files = sorted([f for f in os.listdir(workflow_dir) if f.endswith('.json')])
-            
+            files = sorted([f.name for f in self.workflow_dir.glob("*.json")])
             index = int(args[1])
             if not (1 <= index <= len(files)):
-                yield event.plain_result(f"序号错误，请输入 1 到 {len(files)} 之间的数字。")
+                yield event.plain_result(f"❌ 序号错误，请输入 1 到 {len(files)} 之间的数字")
                 return
-            
             filename = files[index - 1]
         except ValueError:
-            yield event.plain_result("序号必须是数字。")
+            yield event.plain_result("❌ 请输入有效的数字序号")
             return
         except Exception as e:
-            yield event.plain_result(f"查找工作流失败: {e}")
+            yield event.plain_result(f"❌ 查找工作流失败: {e}")
             return
-        # --- 修改结束 ---
 
-        # 获取可选参数
         inp_id = args[2] if len(args) > 2 else None
-        out_id = args[3] if len(args) > 3 else None 
+        neg_id = args[3] if len(args) > 3 else None
+        out_id = args[4] if len(args) > 4 else None
 
         if not self.api:
-            yield event.plain_result("插件未初始化。")
+            yield event.plain_result("❌ ComfyUI API 未初始化")
             return
 
-        # 调用 API 进行热切换 (传入 seed_id)
-        exists, msg = self.api.reload_config(filename, input_id=inp_id, output_id=out_id)
-        yield event.plain_result(msg)
+        exists, msg = self.api.reload_config(
+            filename, 
+            input_id=inp_id, 
+            neg_node_id=neg_id,
+            output_id=out_id
+        )
+        
+        status = "✅" if exists else "⚠️"
+        logger.info(f"[ComfyUI] 管理员 {user_id} 切换工作流: {filename}")
+        yield event.plain_result(f"{status} {msg}")
 
     @filter.command("comfy_save")
     async def cmd_comfy_save(self, event: AstrMessageEvent):
-        """保存/导入工作流
-        用法: /comfy_save <文件名> <JSON内容>
-        """
-        if not self._check_permission(event):
-            yield event.plain_result("权限不足。")
+        """保存/导入工作流"""
+        user_id = str(event.get_sender_id())
+        if user_id not in self.admin_user_ids:
+            yield event.plain_result("🚫 权限不足，仅管理员可导入工作流")
             return
 
-        # 1. 解析命令
         full_text = event.message_str
-        # 去掉命令头 /comfy_save
         content = full_text.split(maxsplit=2)
         
         if len(content) < 3:
-            yield event.plain_result("用法: /comfy_save <新文件名.json> <JSON代码>")
+            yield event.plain_result(
+                "❌ 参数不足\n"
+                "用法：/comfy_save <文件名> <JSON内容>\n"
+                "示例：/comfy_save my_workflow.json {\"1\":{...}}"
+            )
             return
         
         filename = content[1]
@@ -373,54 +530,37 @@ class ComfyUIPlugin(Star):
         if not filename.endswith(".json"):
             filename += ".json"
 
-        # 2. 校验 JSON
         try:
-            # 尝试清洗一下代码块标记 (```json ... ```)
             json_str = json_str.replace("```json", "").replace("```", "").strip()
             json_data = json.loads(json_str)
-        except json.JSONDecodeError:
-            yield event.plain_result("解析失败：这不是合法的 JSON 格式。")
+        except json.JSONDecodeError as e:
+            yield event.plain_result(f"❌ JSON 解析失败：{str(e)[:50]}")
             return
 
-        # 3. 保存文件
-        workflow_dir = os.path.join(current_directory, 'workflow')
-        os.makedirs(workflow_dir, exist_ok=True)
-        save_path = os.path.join(workflow_dir, filename)
+        save_path = self.workflow_dir / filename
 
         try:
             with open(save_path, 'w', encoding='utf-8') as f:
                 json.dump(json_data, f, indent=2, ensure_ascii=False)
-            yield event.plain_result(f"✅ 保存成功！\n文件已存为: {filename}\n请使用 /comfy_use {filename} 切换。")
+            
+            self._auto_update_schema()
+            
+            logger.info(f"[ComfyUI] 管理员 {user_id} 导入工作流: {filename}")
+            yield event.plain_result(
+                f"✅ 保存成功！\n"
+                f"文件：{filename}\n"
+                f"使用 /comfy_ls 查看列表"
+            )
         except Exception as e:
-            yield event.plain_result(f"保存文件失败: {e}")
+            yield event.plain_result(f"❌ 保存失败: {e}")
 
-    # 辅助：简易权限检查
-    def _check_permission(self, event: AstrMessageEvent) -> bool:
-        uid = str(event.get_sender_id())
-        return uid in self.admin_user_ids
     @filter.command("画图", aliases=["绘画"])
     async def cmd_paint(self, event: AstrMessageEvent):
-        if self._is_locked_for(event):
-            yield event.plain_result("全局锁定。")
-            return
-        if self._is_group_message(event) and not self._is_group_allowed(event):
-            yield event.plain_result(f"禁止输入。")
-            return
-        
-        # 调用核心逻辑
         async for result in self._handle_paint_logic(event, direct_send=False):
             yield result
 
     @filter.command("画图no")
     async def cmd_paint_no(self, event: AstrMessageEvent):
-        if self._is_locked_for(event):
-            yield event.plain_result("全局锁定。")
-            return
-        if self._is_group_message(event) and not self._is_group_allowed(event):
-            yield event.plain_result(f"禁止输入。")
-            return
-
-        # 调用核心逻辑
         async for result in self._handle_paint_logic(event, direct_send=True):
             yield result
 
@@ -455,28 +595,6 @@ class ComfyUIPlugin(Star):
             except Exception:
                 continue
         return None
-
-    def _is_group_allowed(self, event: AstrMessageEvent) -> bool:
-        if not self._is_group_message(event):
-            return True
-        gid = self._get_group_id(event)
-        if not gid:
-            return False
-
-        uid = str(event.get_sender_id())
-
-        # 管理员逻辑
-        if uid in self.admin_user_ids:
-            if gid in self.whitelist_group_ids:
-                return True
-            else:
-                if self.admin_bypass_whitelist:
-                    return True
-                else:
-                    return False
-
-        # 普通用户
-        return gid in self.whitelist_group_ids
 
     def _get_self_id(self, event: AstrMessageEvent):
         getters = [
@@ -522,27 +640,6 @@ class ComfyUIPlugin(Star):
             ascii_pat = re.compile('|'.join(parts), re.IGNORECASE) if parts else None
             self._policy_patterns[policy] = ascii_pat
 
-    def _is_locked_for(self, event: AstrMessageEvent) -> bool:
-        if not self.lockdown:
-            return False
-        return str(event.get_sender_id()) not in self.admin_user_ids
-
-    def _check_and_update_cooldown(self, user_id: str) -> (bool, int):
-        if user_id in self.admin_user_ids:
-            if self.admin_bypass_cooldown:
-                return True, 0
-
-        current_time = time.time()
-        last_time = self.user_cooldowns.get(user_id, 0)
-        elapsed = current_time - last_time
-
-        if elapsed < self.cooldown_seconds:
-            remain = int(self.cooldown_seconds - elapsed)
-            return False, remain
-
-        self.user_cooldowns[user_id] = current_time
-        return True, 0
-
     def _get_policy_for_event(self, event: AstrMessageEvent) -> str:
         if self._is_group_message(event):
             gid = self._get_group_id(event)
@@ -575,153 +672,148 @@ class ComfyUIPlugin(Star):
                 result.append(w)
         return result
 
+    @filter.on_llm_response(priority=1)
+    async def _extract_prompt_before_filter(self, event: AstrMessageEvent, resp: LLMResponse):
+        """提取 LLM 回复中的提示词"""
+        if not resp or not resp.completion_text:
+            return
+        
+        full_text = resp.completion_text
+        m = re.search(r"提示词是\s*[:：]?\s*(.+)", full_text)
+        
+        if not m:
+            return
+        
+        prompt = m.group(1).strip()
+        prompt = re.sub(r"</[^>]+>.*$", "", prompt, flags=re.DOTALL).strip()
+        prompt = prompt.strip('`"\'""''').strip()
+        
+        if not prompt:
+            return
+        
+        event._comfy_extracted_prompt = prompt
+
     @filter.on_decorating_result(priority=99)
     async def _auto_paint_from_llm(self, event: AstrMessageEvent):
-        """
-        当 LLM 普通文本里出现『提示词是 "xxx"』时，
-        立即调用 comfyui_txt2img 生成并发送图片。
-        """
-        import re
+        """自动绘图"""
+        if getattr(event, "_comfy_auto_painted", False):
+            return
         
-        # 0) 检查是否已经生过图
+        prompt = getattr(event, "_comfy_extracted_prompt", None)
+        if not prompt:
+            return
+        
+        event._comfy_auto_painted = True
+        
         def _has_image(comp):
-            from astrbot.core.message.components import Image, Node
             if isinstance(comp, Image):
                 return True
             if isinstance(comp, Node):
                 return any(_has_image(c) for c in comp.content)
             return False
-
-        chain = event.get_result().chain
+        
+        result = event.get_result()
+        if not result:
+            return
+            
+        chain = result.chain
         if chain and any(_has_image(c) for c in chain):
             return
-
-        # 1) 拿到本次回复的完整文本
-        try:
-            text_chunks = [c.text for c in chain if hasattr(c, "text")]
-            full_text = "".join(text_chunks)
-        except Exception:
-            full_text = ""
-
-        if not full_text:
-            return
-
-        # 2) 提取 prompt
-        prompt = None
-        m = re.search(r"提示词是[   :：]\s*([^\n]+)", full_text)
-        if m:
-            prompt = (
-                m.group(1)
-                .strip()
-                .lstrip('`"\'')  # 修复：包含了反引号、双引号、转义后的单引号
-                .rstrip('`"\'')
-                .strip()
-            )
-
-        if not prompt:
-            return
-
-        # 3) 调用绘图工具
+        
         extra_chain = []
-        async for res in self.comfyui_txt2img(
-            event,
-            prompt=prompt,
-            direct_send=True,
-        ):
-            if hasattr(res, "chain"):
-                extra_chain.extend(res.chain)
-
-        if extra_chain:
-            event.get_result().chain.extend(extra_chain)
+        try:
+            async for res in self.comfyui_txt2img(
+                event,
+                prompt=prompt,
+                direct_send=True,
+            ):
+                if hasattr(res, "chain"):
+                    extra_chain.extend(res.chain)
+        except Exception as e:
+            logger.error(f"[ComfyUI] 自动绘图异常: {e}")
+            return
+        
+        if extra_chain and result:
+            result.chain.extend(extra_chain)
 
     @llm_tool(name="comfyui_txt2img")
     async def comfyui_txt2img(self, event: AstrMessageEvent, ctx: Context = None, prompt: str = None, text: str = None, img_width: int = None, img_height: int = None, direct_send: bool = False) -> MessageEventResult:
-        """
-        (此处的 Prompt 已被 _conf_schema.json 中的配置覆盖)
-        """
-        if self._is_locked_for(event):
-            yield event.plain_result("全局锁定。")
+        """ComfyUI 文生图工具"""
+        
+        # 权限检查
+        allowed, reason = self._check_access(event)
+        if not allowed:
+            yield event.plain_result(reason)
             return
 
-        # === 参数兼容处理 ===
+        # 参数处理
         if not prompt and text:
             prompt = text
 
-        # === 空参数强制报错，防止兜底中文 ===
         if not prompt:
-            yield event.plain_result("LLM 没有提供英文 prompt，请重试。")
+            yield event.plain_result("❌ 未提供 prompt，请重试")
             return
 
-
-        if self._is_group_message(event) and not self._is_group_allowed(event):
-            yield event.plain_result(f"禁止输入。")
-            return
-
-        if not getattr(self, 'api', None) and not getattr(self, 'comfy_ui', None):
-            yield event.plain_result("错误：ComfyUI 服务未连接。")
-            return
-
-        # ========= 新增：兜底 prompt 逻辑 =========
-        if not isinstance(prompt, str) or not prompt:
+        if not isinstance(prompt, str) or not prompt.strip():
             raw = getattr(event, "message_str", "") or ""
             prompt = re.sub(r'```math\s*At:\d+```\s*', '', raw).strip()
             if not prompt:
-                yield event.plain_result("请输入提示词。")
+                yield event.plain_result("❌ 请输入提示词")
                 return
+
+        # API 检查
+        if not getattr(self, 'api', None):
+            yield event.plain_result("❌ ComfyUI 服务未连接，请检查配置")
+            return
         
         try:
-            if prompt:
-                user_id = str(event.get_sender_id())
-                is_admin = user_id in self.admin_user_ids
-                can_bypass_sensitive = is_admin and self.admin_bypass_sensitive
-                sensitive = self._find_sensitive_words(prompt, event)
-
-                if sensitive and not can_bypass_sensitive:
-                    tip = "、".join(sensitive)
-                    logger.warning(f"用户 {user_id} 通过 LLM 尝试生成违禁内容，触发敏感词: {tip}")
-                    yield event.plain_result(f"抱歉，检测到敏感词：{tip}。我无法为您绘制。")
-                    return
-                elif sensitive and can_bypass_sensitive:
-                    logger.info(f"管理员 {user_id} 使用敏感词 {sensitive}，已放行。")
-
-            # ====== 统一冷却逻辑 ======
-            user_id = str(event.get_sender_id())
-            ok, remain = self._check_and_update_cooldown(user_id)
-            if not ok:
-                yield event.plain_result(f"请求太频繁, 请在 {remain} 秒后重试。")
+            # 敏感词检查
+            passed, sensitive = self._check_sensitive(prompt, event)
+            if not passed:
+                tip = "、".join(sensitive[:5])
+                logger.warning(f"[ComfyUI] 用户 {event.get_sender_id()} 触发敏感词: {tip}")
+                yield event.plain_result(f"🚫 检测到敏感词：{tip}，无法生成")
                 return
 
-            logger.info(f"prompt:'{prompt}' | mode=txt2img | direct_send={direct_send}")
+            # 冷却检查
+            ok, remain = self._check_cooldown(event)
+            if not ok:
+                yield event.plain_result(f"⏱️ 冷却中，请在 {remain} 秒后重试")
+                return
 
-            # === 调用 API ===
-            api_instance = getattr(self, 'api', getattr(self, 'comfy_ui', None))
-            img_data, error_msg = await api_instance.generate(prompt)
+            logger.info(f"[ComfyUI] 🎨 开始生成 | 用户: {event.get_sender_id()} | Prompt: {prompt[:50]}...")
+
+            # 调用 API
+            img_data, error_msg = await self.api.generate(prompt)
 
             if not img_data:
-                logger.error(f"ComfyUI 生成失败: {error_msg}")
-                yield event.plain_result(f"生成图片失败了: {error_msg}")
+                logger.error(f"[ComfyUI] 生成失败: {error_msg}")
+                yield event.plain_result(f"❌ 生成失败：{error_msg}")
                 return
 
             # 保存图片
             img_filename = f"{uuid.uuid4()}.png"
-            img_path = os.path.join(img_output_dir, img_filename)
+            img_path = self.output_dir / img_filename
             with open(img_path, 'wb') as fp:
                 fp.write(img_data)
+            
+            logger.info(f"[ComfyUI] ✅ 图片已保存: {img_filename}")
 
             # 发送结果
             if direct_send:
-                image_component = Image.fromFileSystem(img_path)
+                image_component = Image.fromFileSystem(str(img_path))
                 yield event.chain_result([image_component])
             else:
                 self_id = self._get_self_id(event) or "0"
-                image_component = Image.fromFileSystem(img_path)
+                image_component = Image.fromFileSystem(str(img_path))
                 forward_node = Node(
                     user_id=int(self_id),
-                    nickname="小鹿",
+                    nickname="ComfyUI",
                     content=[image_component]
                 )
                 yield event.chain_result([forward_node])
 
         except Exception as e:
-            logger.error(f"画图插件执行异常: {e}")
-            yield event.plain_result(f"内部错误: {str(e)}")
+            logger.error(f"[ComfyUI] 执行异常: {e}")
+            logger.error(traceback.format_exc())
+            yield event.plain_result(f"❌ 内部错误: {str(e)[:50]}")
