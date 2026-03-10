@@ -12,7 +12,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import *
 from astrbot.api import llm_tool, logger
 from astrbot.api.provider import LLMResponse
-
+from astrbot.core.message.message_event_result import MessageChain
 # 尝试导入 StarTools（兼容不同版本）
 try:
     from astrbot.api.star import StarTools
@@ -62,11 +62,16 @@ class ComfyUIPlugin(Star):
         self.user_cooldowns = {}
         self.admin_user_ids = set(map(str, control_conf.get("admin_ids", [])))
         self.lockdown = bool(control_conf.get("lockdown", False))
+        self.lockdown_command_enabled = bool(control_conf.get("lockdown_command_enabled", True))
         self.whitelist_group_ids = set(map(str, control_conf.get("whitelist_group_ids", [])))
     
         llm_settings = config.get("llm_settings", {})
         self.multi_image_mode = llm_settings.get("multi_image_mode", False)
         logger.info(f"[ComfyUI] 🖼️ 多图模式: {'开启' if self.multi_image_mode else '关闭'}")
+        
+        self.discard_prompt_from_history = llm_settings.get("discard_prompt_from_history", False)
+        if self.discard_prompt_from_history:
+            logger.info("[ComfyUI] 🗑️ 绘图提示词历史丢弃: 开启")       
         # 策略配置
         self.default_group_policy = str(control_conf.get("default_group_policy", "none")).lower()
         self.default_private_policy = str(control_conf.get("default_private_policy", "none")).lower()
@@ -92,6 +97,7 @@ class ComfyUIPlugin(Star):
         logger.info(f"[ComfyUI] 👤 超级管理员: {admin_count} 个 | 🏠 白名单群: {group_count} 个")
         if self.lockdown:
             logger.warning("[ComfyUI]⚠️ 绘图功能全局锁定已启用，仅超级管理员可用")
+        logger.info(f"[ComfyUI] 🔐 锁定命令开关: {'开启' if self.lockdown_command_enabled else '关闭'}")
 
         # 加载敏感词
         self.lexicon = {}
@@ -287,26 +293,65 @@ class ComfyUIPlugin(Star):
 
     @filter.on_llm_request(priority=100)
     async def inject_system_prompt(self, event: AstrMessageEvent, req):
-        """注入系统提示词（priority=100 确保在自定义头部之后）"""
+        """注入系统提示词 + 清理历史中的绘图提示词"""
         try:
             llm_settings = self.config.get("llm_settings", {}) 
             my_prompt = llm_settings.get("system_prompt", "")
 
-            if not my_prompt:
-                return
-
-            current_prompt = getattr(req, "system_prompt", "") or ""
-
-            if my_prompt in current_prompt:
-                return
-
-            if current_prompt:
-                req.system_prompt = f"{current_prompt}\n\n{my_prompt}".strip()
-            else:
-                req.system_prompt = my_prompt.strip()
+            if my_prompt:
+                current_prompt = getattr(req, "system_prompt", "") or ""
+                if my_prompt not in current_prompt:
+                    if current_prompt:
+                        req.system_prompt = f"{current_prompt}\n\n{my_prompt}".strip()
+                    else:
+                        req.system_prompt = my_prompt.strip()
 
         except Exception as e:
             logger.error(f"[ComfyUI] 注入提示词异常: {e}")
+
+        # 清理历史中的绘图提示词
+        if self.discard_prompt_from_history:
+            try:
+                self._clean_pic_tags_from_req(req)
+            except Exception as e:
+                logger.error(f"[ComfyUI] 清理提示词异常: {e}")
+
+    def _clean_pic_tags_from_req(self, req):
+        """从请求的 conversation.history 中清理 <pic> 标签"""
+        pic_pattern = re.compile(r'<pic\s+prompt=".*?">', re.DOTALL)
+
+        conversation = getattr(req, "conversation", None)
+        if conversation is None:
+            logger.warning("[ComfyUI] 🗑️ req.conversation 不存在，跳过清理")
+            return
+
+        history_raw = getattr(conversation, "history", None)
+        if not history_raw:
+            return
+
+        try:
+            history = json.loads(history_raw) if isinstance(history_raw, str) else history_raw
+        except (json.JSONDecodeError, TypeError):
+            return
+
+        if not isinstance(history, list):
+            return
+
+        cleaned = 0
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("role") != "assistant":
+                continue
+            content = entry.get("content", "")
+            if isinstance(content, str) and pic_pattern.search(content):
+                entry["content"] = pic_pattern.sub("", content).strip()
+                cleaned += 1
+
+        if cleaned:
+            # 写回 conversation.history
+            conversation.history = json.dumps(history, ensure_ascii=False)
+            logger.info(f"[ComfyUI] 🗑️ 已从 conversation.history 中清理 {cleaned} 条消息的绘图提示词")
 
     async def initialize(self):
         self.context.activate_llm_tool("comfyui_txt2img")
@@ -396,11 +441,12 @@ class ComfyUIPlugin(Star):
         if is_admin:
             tips.extend([
                 "【管理员指令】 👑",
-                "  /comfy_ls          列出所有工作流",
-                "  /comfy_use <序号>  切换工作流",
-                "  /comfy_save        导入新工作流",
-                "  /comfy_add         步数覆盖（按节点ID）",
-                "  /违禁级别          设置群敏感度",
+                "  /comfy_ls              列出所有工作流",
+                "  /comfy_use <序号>      切换工作流",
+                "  /comfy_save            导入新工作流",
+                "  /comfy_add             步数覆盖（按节点ID）",
+                "  /comfy_lock on|off     切换全局锁定",
+                "  /违禁级别              设置群敏感度",
                 ""
             ])
         
@@ -409,6 +455,7 @@ class ComfyUIPlugin(Star):
         tips.append(f"📍 当前位置：{'群聊 ' + gid if gid else '私聊'}")
         tips.append(f"🔒 违禁级别：{policy}")
         tips.append(f"⏱️ 冷却时间：{self.cooldown_seconds} 秒")
+        tips.append(f"🔐 全局锁定：{'开启' if self.lockdown else '关闭'}")
         if is_admin:
             tips.append(f"👑 身份：管理员")
             tips.append(f"📂 数据目录：{self.data_dir}")
@@ -706,6 +753,45 @@ class ComfyUIPlugin(Star):
         self.group_policies[gid] = level
         logger.info(f"[ComfyUI] 群 {gid} 违禁级别已设为 {level}（操作者：{user_id}）")
         yield event.plain_result(f"✅ 已将本群违禁级别设置为：{level}")
+
+    @filter.command("comfy_lock", aliases=["全局锁定", "锁图", "绘图锁定"])
+    async def cmd_comfy_lock(self, event: AstrMessageEvent):
+        """管理员动态切换全局锁定状态"""
+        user_id = str(event.get_sender_id())
+        if user_id not in self.admin_user_ids:
+            yield event.plain_result("🚫 权限不足，仅管理员可切换全局锁定")
+            return
+
+        if not self.lockdown_command_enabled:
+            yield event.plain_result("⚠️ 锁定命令开关已关闭，请在插件配置中启用 control.lockdown_command_enabled")
+            return
+
+        args = event.message_str.split()
+        action = args[1].lower() if len(args) > 1 else "status"
+
+        if action in ("status", "状态", "查询"):
+            yield event.plain_result(
+                "🔐 全局锁定状态\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"当前: {'开启' if self.lockdown else '关闭'}\n"
+                f"命令开关: {'开启' if self.lockdown_command_enabled else '关闭'}\n"
+                "用法: /comfy_lock on|off|status"
+            )
+            return
+
+        if action in ("on", "true", "1", "enable", "start", "开启"):
+            self.lockdown = True
+            logger.warning(f"[ComfyUI] 管理员 {user_id} 通过命令开启全局锁定")
+            yield event.plain_result("🔒 已开启全局锁定：当前仅超级管理员可用绘图功能")
+            return
+
+        if action in ("off", "false", "0", "disable", "stop", "关闭"):
+            self.lockdown = False
+            logger.info(f"[ComfyUI] 管理员 {user_id} 通过命令关闭全局锁定")
+            yield event.plain_result("🔓 已关闭全局锁定：恢复正常访问控制")
+            return
+
+        yield event.plain_result("❌ 参数无效，用法：/comfy_lock on|off|status")
 
     @filter.command("comfy_ls")
     async def cmd_comfy_list(self, event: AstrMessageEvent):
@@ -1048,6 +1134,31 @@ class ComfyUIPlugin(Star):
         except Exception as e:
             yield event.plain_result(f"❌ 清空失败: {e}")
 
+    @filter.command("当前工作流", aliases=["comfy_current", "当前wf"])
+    async def cmd_comfy_current(self, event: AstrMessageEvent):
+        current_file = self.config.get("json_file") or self.config.get("workflow_json") or "未配置"
+        input_id = self.config.get("input_node_id") or self.config.get("input_id") or "未配置"
+        output_id = self.config.get("output_node_id") or self.config.get("output_id") or "未配置"
+        lines = [
+            "🧠 当前 ComfyUI 工作流",
+            f"- 文件: {current_file}",
+            f"- 输入节点: {input_id}",
+            f"- 输出节点: {output_id}",
+        ]
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("重绘", aliases=["重抽", "reroll"])
+    async def cmd_reroll(self, event: AstrMessageEvent):
+        full_msg = (event.message_str or "").strip()
+        full_msg = re.sub(r'\[At:\d+\]\s*', '', full_msg).strip()
+        parts = full_msg.split(None, 1)
+        prompt = parts[1].strip() if len(parts) > 1 else ""
+        if not prompt:
+            yield event.plain_result("📖 用法: /重绘 <提示词>\n示例: /重绘 1girl, silver hair, cinematic lighting")
+            return
+        async for result in self._handle_paint_logic(event, direct_send=True):
+            yield result
+
     @filter.command("画图", aliases=["绘画"])
     async def cmd_paint(self, event: AstrMessageEvent):
         async for result in self._handle_paint_logic(event, direct_send=False):
@@ -1222,12 +1333,22 @@ class ComfyUIPlugin(Star):
         if len(cleaned_prompts) == 1:
             event._comfy_extracted_prompt = cleaned_prompts[0]
             logger.info(f"[ComfyUI] 📝 检测到单图模式: {cleaned_prompts[0][:50]}...")
+            # 丢弃绘图提示词，避免污染历史记录上下文
+            if self.discard_prompt_from_history:
+                resp.completion_text = cleaned_text
+                resp.result_chain = MessageChain().message(cleaned_text)
+                logger.info("[ComfyUI] 🗑️ 已从历史记录中移除绘图提示词")
             return
     
         # 多图模式
         if self.multi_image_mode:
             parts = re.split(r'<pic\s+prompt=".*?">', full_text, flags=re.DOTALL)
         
+            # 检测原始文本中的 <render> 标签信息，用于补全被切割的段落
+            render_match = re.search(r'<render\b[^>]*>', full_text)
+            render_open_tag = render_match.group(0) if render_match else None
+            render_close_tag = "</render>" if render_open_tag else None
+
             segments = []
             prompt_idx = 0
         
@@ -1236,6 +1357,16 @@ class ComfyUIPlugin(Star):
                 text = re.sub(r'</?ctx>', '', text)
                 text = text.strip()
                 if text:
+                    # 如果原文使用了 <render> 标签，确保每个文本段都有完整的标签对
+                    if render_open_tag:
+                        has_open = bool(re.search(r'<render\b', text))
+                        has_close = '</render>' in text
+                        if has_open and not has_close:
+                            text = text + render_close_tag
+                        elif has_close and not has_open:
+                            text = render_open_tag + text
+                        elif not has_open and not has_close:
+                            text = render_open_tag + text + render_close_tag
                     segments.append({"type": "text", "content": text})
                 if prompt_idx < len(cleaned_prompts):
                     segments.append({"type": "prompt", "content": cleaned_prompts[prompt_idx]})
@@ -1244,9 +1375,11 @@ class ComfyUIPlugin(Star):
             if segments:
                 event._comfy_segments = segments
                 logger.info(f"[ComfyUI] 📝 检测到多图模式，共 {len(cleaned_prompts)} 张图片")
-        else:
-            event._comfy_extracted_prompt = cleaned_prompts[0]
-            logger.warning(f"[ComfyUI] 检测到 {len(cleaned_prompts)} 个提示词，但多图模式未开启，仅使用第一个")
+                # 丢弃绘图提示词，避免污染历史记录上下文
+                if self.discard_prompt_from_history:
+                    resp.completion_text = cleaned_text
+                    resp.result_chain = MessageChain().message(cleaned_text)
+                    logger.info("[ComfyUI] 🗑️ 已从历史记录中移除绘图提示词（多图模式）")            
 
     # ====== 自动绘图逻辑保持不变 ======
     @filter.on_decorating_result(priority=99)
@@ -1266,12 +1399,20 @@ class ComfyUIPlugin(Star):
             allowed, reason = self._check_access(event)
             if not allowed:
                 logger.warning(f"[ComfyUI] 多图请求被拒绝: {reason}")
+                try:
+                    await event.send(event.plain_result(reason))
+                except Exception as e:
+                    logger.error(f"[ComfyUI] 发送权限拒绝提示失败: {e}")
                 return
 
             # 冷却检查
             ok, remain = self._check_cooldown(event)
             if not ok:
                 logger.info(f"[ComfyUI] 用户 {event.get_sender_id()} 冷却中")
+                try:
+                    await event.send(event.plain_result(f"⏱️ 冷却中，请在 {remain} 秒后重试"))
+                except Exception as e:
+                    logger.error(f"[ComfyUI] 发送冷却提示失败: {e}")
                 return
 
             # 敏感词预检所有 prompt
@@ -1281,6 +1422,10 @@ class ComfyUIPlugin(Star):
                     if not passed:
                         tip = "、".join(sensitive[:3])
                         logger.warning(f"[ComfyUI] 多图模式触发敏感词: {tip}")
+                        try:
+                            await event.send(event.plain_result(f"🚫 检测到敏感词：{tip}，无法生成图片"))
+                        except Exception as e:
+                            logger.error(f"[ComfyUI] 发送敏感词提示失败: {e}")
                         return
 
             # 构建新的 chain：文字段 + 图片标记交替
@@ -1315,6 +1460,10 @@ class ComfyUIPlugin(Star):
         allowed, reason = self._check_access(event)
         if not allowed:
             logger.warning(f"[ComfyUI] 单图请求被拒绝: {reason}")
+            try:
+                await event.send(event.plain_result(reason))
+            except Exception as e:
+                logger.error(f"[ComfyUI] 发送权限拒绝提示失败: {e}")
             return
 
         # 敏感词检查
@@ -1322,12 +1471,20 @@ class ComfyUIPlugin(Star):
         if not passed:
             tip = "、".join(sensitive[:5])
             logger.warning(f"[ComfyUI] 用户 {event.get_sender_id()} 触发敏感词: {tip}")
+            try:
+                await event.send(event.plain_result(f"🚫 检测到敏感词：{tip}，无法生成图片"))
+            except Exception as e:
+                logger.error(f"[ComfyUI] 发送敏感词提示失败: {e}")
             return
 
         # 冷却检查
         ok, remain = self._check_cooldown(event)
         if not ok:
             logger.info(f"[ComfyUI] 用户 {event.get_sender_id()} 冷却中，图片跳过")
+            try:
+                await event.send(event.plain_result(f"⏱️ 冷却中，请在 {remain} 秒后重试"))
+            except Exception as e:
+                logger.error(f"[ComfyUI] 发送冷却提示失败: {e}")
             return
 
         # 不修改 result.chain → 文字由框架/HtmlRender 正常发送
@@ -1366,6 +1523,54 @@ class ComfyUIPlugin(Star):
         except Exception as e:
             logger.error(f"[ComfyUI] 异步绘图异常: {e}")
             logger.error(traceback.format_exc())
+    @filter.on_decorating_result(priority=5)
+    async def _cleanup_history_prompts(self, event: AstrMessageEvent):
+        """在所有处理完成后，直接从对话历史中移除绘图提示词"""
+        if not self.discard_prompt_from_history:
+            return
+
+        # 只在有提取到提示词时才需要清理
+        has_prompt = hasattr(event, '_comfy_extracted_prompt') or hasattr(event, '_comfy_segments')
+        if not has_prompt:
+            return
+
+        try:
+            conv_mgr = self.context.conversation_manager
+            unified_msg_origin = event.unified_msg_origin
+            conv_id = await conv_mgr.get_curr_conversation_id(unified_msg_origin)
+
+            if not conv_id:
+                return
+
+            conversation = await conv_mgr.get_conversation(unified_msg_origin, conv_id)
+            if not conversation:
+                return
+
+            try:
+                history = json.loads(conversation.history) if conversation.history else []
+            except json.JSONDecodeError:
+                return
+
+            modified = False
+            for entry in history:
+                if entry.get("role") != "assistant":
+                    continue
+                content = str(entry.get("content", ""))
+                cleaned = re.sub(r'<pic\s+prompt=".*?">', '', content, flags=re.DOTALL)
+                if cleaned != content:
+                    entry["content"] = cleaned.strip()
+                    modified = True
+
+            if modified:
+                await conv_mgr.update_conversation(
+                    unified_msg_origin=unified_msg_origin,
+                    conversation_id=conv_id,
+                    history=history,
+                )
+                logger.info("[ComfyUI] 🗑️ 已从对话历史中清理绘图提示词")
+
+        except Exception as e:
+            logger.error(f"[ComfyUI] 清理历史记录失败: {e}")            
     @filter.on_decorating_result(priority=10)
     async def _send_multi_image_results(self, event: AstrMessageEvent):
         """多图模式 - 阶段2：在 HtmlRender 渲染完成后，分组发送"""

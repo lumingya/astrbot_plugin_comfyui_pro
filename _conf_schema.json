@@ -17,24 +17,22 @@
         "options": [
           "Pornmaster_z-image-t2i_2025-11-29(3).json",
           "workflow_api.json",
-          "爱丽丝-1024.json",
+          "爱丽丝-3d.json",
+          "爱丽丝-QvQ.json",
           "爱丽丝-cunny.json",
-          "爱丽丝-yu2.json",
-          "爱丽丝-yyy.json",
-          "爱丽丝-手办.json",
-          "爱丽丝-测.json",
-          "爱丽丝-玉.json"
+          "爱丽丝-l.json",
+          "爱丽丝-y.json",
+          "爱丽丝-手办.json"
         ],
         "enum": [
           "Pornmaster_z-image-t2i_2025-11-29(3).json",
           "workflow_api.json",
-          "爱丽丝-1024.json",
+          "爱丽丝-3d.json",
+          "爱丽丝-QvQ.json",
           "爱丽丝-cunny.json",
-          "爱丽丝-yu2.json",
-          "爱丽丝-yyy.json",
-          "爱丽丝-手办.json",
-          "爱丽丝-测.json",
-          "爱丽丝-玉.json"
+          "爱丽丝-l.json",
+          "爱丽丝-y.json",
+          "爱丽丝-手办.json"
         ]
       },
       "input_node_id": {
@@ -71,6 +69,13 @@
         "type": "bool",
         "default": false,
         "hint": "关闭时只会生成第一个提示词的图片；开启后会依次生成所有图片"
+      },
+      "discard_prompt_from_history": {
+        "title": "丢弃绘图提示词历史",
+        "description": "开启后，LLM 生成的绘图提示词（<pic prompt>标签）不会保留在对话历史中，减少上下文占用",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后每次绘图的英文提示词不会累积在历史记录里，可显著减少上下文长度"
       },
       "system_prompt": {
         "description": "ComfyUI 绘图工具的系统提示词",
@@ -114,6 +119,11 @@
         "type": "bool",
         "default": false
       },
+      "lockdown_command_enabled": {
+        "description": "启用 /comfy_lock 命令开关（管理员可动态开关全局锁定）",
+        "type": "bool",
+        "default": true
+      },
       "admin_bypass": {
         "description": "管理员特权设置",
         "type": "object",
@@ -138,3 +148,5 @@
     }
   }
 }
+
+/* Optional hardening guidance: use a normalized server_address such as http://127.0.0.1:8188 and avoid trailing slashes. */

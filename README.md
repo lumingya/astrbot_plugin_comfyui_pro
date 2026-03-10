@@ -51,6 +51,7 @@
 ### 🛡️ 完善的风控与权限
 *   **分级违禁词过滤**: 内置 `Lite` 和 `Full` 两级敏感词库，支持中英文过滤，可为不同群组设置不同策略。
 *   **白名单与全局锁定**: 可设置仅在白名单群组生效，或一键开启“全局锁定”，仅允许管理员使用。
+*   **锁定命令开关**: 支持 `/comfy_lock on|off|status` 动态切换全局锁定，也可以在配置里关闭这个命令入口。
 *   **管理员特权**: 管理员可配置“无视冷却”、“无视白名单”、“无视敏感词”等超级权限。
 
 ---
@@ -74,6 +75,8 @@
 ### 4. 访问控制 (Control)
 *   **管理员与白名单**: 设置管理员 QQ 号和允许使用插件的群号。
 *   **冷却时间**: 防止用户刷屏。
+*   **全局锁定**: `lockdown` 为静态总开关，开启后仅管理员可用。
+*   **锁定命令开关**: `lockdown_command_enabled` 控制是否允许管理员使用 `/comfy_lock on|off|status` 动态切换锁定状态。
 *   **违禁词策略**: 为私聊和群聊设置默认的敏感词拦截等级 (none/lite/full)。
 
 ---
@@ -99,6 +102,7 @@
 ### 方式三：管理指令 (仅管理员)
 *   `/comfy_ls`: 列出所有可用的工作流，并显示序号。
 *   `/comfy_use <序号> [input_id] [output_id]`: 通过序号快速切换工作流，该方法不需要重载插件。
+*   `/comfy_lock on|off|status`: 动态查看或切换全局锁定状态。
 *   `/违禁级别 <none/lite/full>`: 调整当前群的敏感词拦截等级。
 *   `/comfy帮助`: 查看所有可用指令。
 
@@ -267,3 +271,23 @@ data\plugin_data\astrbot_plugin_comfyui_pro
 - ✅ 冷却时间、违禁级别等所有设置
 
 ---
+
+## Hardening Notes
+
+This plugin now applies a few compatibility-preserving safety defaults:
+
+- `server_address` values are normalized automatically:
+  - surrounding whitespace is trimmed
+  - missing scheme defaults to `http://`
+  - trailing `/` is removed
+- HTTP requests now use sane default timeouts instead of waiting forever
+- transient API failures (for example `429`, `502`, `503`, `504`) are retried with backoff
+- existing configs remain valid; if you already provide a full URL, behavior is unchanged
+
+### Recommended configuration hygiene
+
+- Prefer a direct ComfyUI URL such as `http://127.0.0.1:8188`
+- Avoid trailing slashes in `server_address`
+- If your ComfyUI runs behind a reverse proxy, make sure long-running requests are allowed enough upstream timeout budget
+- Treat workflow execution as asynchronous and expect queue wait time under load
+
