@@ -5,6 +5,82 @@ import aiohttp
 import asyncio
 from pathlib import Path
 from astrbot.api import logger
+import re
+
+
+DEFAULT_CONNECT_TIMEOUT = 10
+DEFAULT_READ_TIMEOUT = 180
+DEFAULT_REQUEST_TIMEOUT = (DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)
+DEFAULT_RETRY_TOTAL = 3
+DEFAULT_RETRY_BACKOFF = 1.0
+_HTTP_SESSION = None
+
+
+def _normalize_server_address(server_address):
+    server_address = (server_address or "").strip()
+    if not server_address:
+        return server_address
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", server_address):
+        server_address = f"http://{server_address}"
+    return server_address.rstrip("/")
+
+
+def _coerce_timeout(value):
+    if value is None or value == "":
+        return DEFAULT_REQUEST_TIMEOUT
+    if isinstance(value, (int, float)):
+        value = max(float(value), 0.1)
+        return (min(value, DEFAULT_CONNECT_TIMEOUT), value)
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        connect_timeout = max(float(value[0]), 0.1)
+        read_timeout = max(float(value[1]), 0.1)
+        return (connect_timeout, read_timeout)
+    return DEFAULT_REQUEST_TIMEOUT
+
+
+def _build_http_session():
+    global _HTTP_SESSION
+    if _HTTP_SESSION is not None:
+        return _HTTP_SESSION
+    session = requests.Session()
+    try:
+        from requests.adapters import HTTPAdapter
+        try:
+            from urllib3.util.retry import Retry
+        except Exception:
+            from requests.packages.urllib3.util.retry import Retry
+        retry = Retry(
+            total=DEFAULT_RETRY_TOTAL,
+            connect=DEFAULT_RETRY_TOTAL,
+            read=DEFAULT_RETRY_TOTAL,
+            status=DEFAULT_RETRY_TOTAL,
+            backoff_factor=DEFAULT_RETRY_BACKOFF,
+            status_forcelist=(408, 409, 425, 429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"]),
+            raise_on_status=False,
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+    except Exception:
+        pass
+    _HTTP_SESSION = session
+    return session
+
+
+def _http_request(method, url, **kwargs):
+    session = _build_http_session()
+    timeout = _coerce_timeout(kwargs.pop("timeout", None))
+    return session.request(method=method, url=url, timeout=timeout, **kwargs)
+
+
+def _http_get(url, **kwargs):
+    return _http_request("GET", url, **kwargs)
+
+
+def _http_post(url, **kwargs):
+    return _http_request("POST", url, **kwargs)
 
 
 class ComfyUI:
@@ -17,8 +93,16 @@ class ComfyUI:
             data_dir: 持久化数据目录（由 main.py 传入）
         """
         # 读取基础配置
-        self.server_address = config.get("server_address", "127.0.0.1:8188")
-        self.url = f"http://{self.server_address}"
+        self.server_address = _normalize_server_address(config.get("server_address", "127.0.0.1:8188"))
+        # 自动判断是否需要 https
+        if self.server_address.startswith("http"):
+            self.url = self.server_address
+        elif "." in self.server_address and ":" not in self.server_address:
+            # 域名格式，用 https
+            self.url = f"https://{self.server_address}"
+        else:
+            # IP:端口格式，用 http
+            self.url = f"http://{self.server_address}"
         
         # 读取绘图参数
         sub_conf = config.get("sub_config", {})

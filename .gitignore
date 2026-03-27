@@ -41,3 +41,6 @@ html_render_cache/
 # 环境变量/密钥
 .env
 .env.*
+# Git 提交脚本（不需要提交）
+git提交.py
+git提交.py

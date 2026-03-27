@@ -7,3 +7,4 @@ repo: https://github.com/lumingya/astrbot_plugin_comfyui_pro
 tags:
   - 画图
   - comfyui
+# Maintainer note: HTTP/client hardening applied for config normalization, retries, and timeout defaults.
