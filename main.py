@@ -10,7 +10,7 @@ from pathlib import Path
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import *
-from astrbot.api import llm_tool, logger
+from astrbot.api import llm_tool, logger, AstrBotConfig
 from astrbot.api.provider import LLMResponse
 from astrbot.core.message.message_event_result import MessageChain
 # 尝试导入 StarTools（兼容不同版本）
@@ -30,11 +30,11 @@ class _ComfyImageMarker:
         self.index = index
 
 @register(
-    "astrbot_plugin_comfyui_pro",  
-    "lumingya",                    
-    "ComfyUI Pro 连接器",           
-    "1.2.0",
-    "https://github.com/lumingya/astrbot_plugin_comfyui_pro" 
+    "astrbot_plugin_comfyui_pro",
+    "lumingya",
+    "ComfyUI Pro 连接器",
+    "2.4.0",
+    "https://github.com/lumingya/astrbot_plugin_comfyui_pro"
 )
 class ComfyUIPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -51,6 +51,8 @@ class ComfyUIPlugin(Star):
         # ====== 3. 设置路径变量 ======
         self.workflow_dir = self.data_dir / "workflow"
         self.output_dir = self.data_dir / "output"
+        self.persona_dir = self.data_dir / "persona"
+        self.profiles_dir = self.data_dir / "profiles"
         self.sensitive_words_path = self.data_dir / "sensitive_words.json"
         
         # ====== 4. 更新 UI 配置 ======
@@ -60,7 +62,6 @@ class ComfyUIPlugin(Star):
         control_conf = config.get("control", {})
         self.cooldown_seconds = control_conf.get("cooldown_seconds", 60)
         self.user_cooldowns = {}
-        self.admin_user_ids = set(map(str, control_conf.get("admin_ids", [])))
         self.lockdown = bool(control_conf.get("lockdown", False))
         self.lockdown_command_enabled = bool(control_conf.get("lockdown_command_enabled", True))
         self.whitelist_group_ids = set(map(str, control_conf.get("whitelist_group_ids", [])))
@@ -92,9 +93,8 @@ class ComfyUIPlugin(Star):
         self.admin_bypass_sensitive = bypass.get("sensitive_words", True)
 
         # 日志：显示管理员和白名单配置
-        admin_count = len(self.admin_user_ids)
         group_count = len(self.whitelist_group_ids)
-        logger.info(f"[ComfyUI] 👤 超级管理员: {admin_count} 个 | 🏠 白名单群: {group_count} 个")
+        logger.info(f"[ComfyUI] 👤 管理员: 使用 AstrBot 系统管理员 | 🏠 白名单群: {group_count} 个")
         if self.lockdown:
             logger.warning("[ComfyUI]⚠️ 绘图功能全局锁定已启用，仅超级管理员可用")
         logger.info(f"[ComfyUI] 🔐 锁定命令开关: {'开启' if self.lockdown_command_enabled else '关闭'}")
@@ -112,6 +112,27 @@ class ComfyUIPlugin(Star):
         except Exception:
             self.lexicon = {"legacy_lite": [], "full": []}
 
+        # ====== 加载当前 persona 选择（持久化） ======
+        self._persona_state_file = self.data_dir / ".current_persona.txt"
+        self.current_persona = None
+        if self._persona_state_file.exists():
+            try:
+                self.current_persona = self._persona_state_file.read_text(encoding="utf-8").strip()
+                logger.info(f"[ComfyUI] 👤 当前 Persona (持久化): {self.current_persona}")
+            except Exception:
+                self.current_persona = None
+
+        # 如果持久化记录不存在，回退到 WebUI 配置中的 persona_file
+        if not self.current_persona:
+            config_persona = config.get("llm_settings", {}).get("persona_file", "").strip()
+            if config_persona:
+                persona_path = self.persona_dir / config_persona
+                if persona_path.exists():
+                    self.current_persona = config_persona
+                    logger.info(f"[ComfyUI] 👤 当前 Persona (配置): {self.current_persona}")
+                else:
+                    logger.warning(f"[ComfyUI] ⚠️ 配置的 Persona 文件不存在: {config_persona}")
+
         self._policy_patterns = {}
         self._build_policy_patterns()
         
@@ -125,6 +146,35 @@ class ComfyUIPlugin(Star):
         except Exception as e:
             logger.error(f"[ComfyUI] ❌ ComfyUI API 初始化失败: {e}")
             logger.error(traceback.format_exc())
+
+        # ====== 加载当前 profile 选择（持久化） ======
+        self._profile_state_file = self.data_dir / ".current_profile.txt"
+        self.current_profile = None
+        if self._profile_state_file.exists():
+            try:
+                self.current_profile = self._profile_state_file.read_text(encoding="utf-8").strip()
+                logger.info(f"[ComfyUI] 📋 当前 Profile (持久化): {self.current_profile}")
+                self._apply_current_profile()
+            except Exception as e:
+                logger.warning(f"[ComfyUI] 应用持久化 profile 失败: {e}")
+                self.current_profile = None
+
+        # 如果持久化记录不存在，回退到 WebUI 配置中的 profile_file
+        if not self.current_profile:
+            config_profile = config.get("profile_settings", {}).get("profile_file", "").strip()
+            if config_profile:
+                profile_path = self.profiles_dir / config_profile
+                if profile_path.exists():
+                    self.current_profile = config_profile
+                    logger.info(f"[ComfyUI] 📋 当前 Profile (配置): {self.current_profile}")
+                    self._apply_current_profile()
+                else:
+                    logger.warning(f"[ComfyUI] ⚠️ 配置的 Profile 文件不存在: {config_profile}")
+
+        # ====== 检测 WebUI 保存请求 ======
+        save_name = config.get("profile_settings", {}).get("save_profile_name", "").strip()
+        if save_name:
+            self._save_profile_from_config(save_name)
 
     # ====== 获取持久化目录 ======
     def _get_persistent_dir(self) -> Path:
@@ -188,47 +238,102 @@ class ComfyUIPlugin(Star):
             except Exception as e:
                 logger.error(f"[ComfyUI] 复制敏感词文件失败: {e}")
 
+        # 复制默认 persona
+        persona_dir = self.data_dir / "persona"
+        persona_dir.mkdir(exist_ok=True)
+        plugin_persona_dir = PLUGIN_DIR / "persona"
+        persona_copied = 0
+        if plugin_persona_dir.exists():
+            for src_file in plugin_persona_dir.glob("*.txt"):
+                dst_file = persona_dir / src_file.name
+                if not dst_file.exists():
+                    try:
+                        shutil.copy2(src_file, dst_file)
+                        persona_copied += 1
+                    except Exception as e:
+                        logger.error(f"[ComfyUI] 复制 persona 失败 {src_file.name}: {e}")
+        if persona_copied > 0:
+            logger.info(f"[ComfyUI] 📋 已复制 {persona_copied} 个默认 Persona")
+
+        # 复制默认 profiles
+        profiles_dir = self.data_dir / "profiles"
+        profiles_dir.mkdir(exist_ok=True)
+        plugin_profiles_dir = PLUGIN_DIR / "profiles"
+        profiles_copied = 0
+        if plugin_profiles_dir.exists():
+            for src_file in plugin_profiles_dir.glob("*.json"):
+                dst_file = profiles_dir / src_file.name
+                if not dst_file.exists():
+                    try:
+                        shutil.copy2(src_file, dst_file)
+                        profiles_copied += 1
+                    except Exception as e:
+                        logger.error(f"[ComfyUI] 复制 profile 失败 {src_file.name}: {e}")
+        if profiles_copied > 0:
+            logger.info(f"[ComfyUI] 📋 已复制 {profiles_copied} 个默认 Profile")
+
     # ====== 更新 Schema ======
     def _auto_update_schema(self):
-        """扫描持久化目录的工作流，更新 UI 下拉列表"""
+        """扫描持久化目录的工作流和 persona，更新 UI 下拉列表"""
         try:
             schema_path = PLUGIN_DIR / '_conf_schema.json'
             workflow_dir = self.data_dir / 'workflow'
 
-            if not workflow_dir.exists():
-                return
-
-            # 排除 .steps.json 文件
-            files = sorted([
-                f.name for f in workflow_dir.glob("*.json")
-                if not f.name.endswith(".steps.json")
-            ])
-        
-            if not files:
-                files = ["workflow_api.json"]
-
             with open(schema_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
-            target = data['workflow_settings']['items']['json_file']
-            target['options'] = files
-            target['enum'] = files
-        
-            with open(schema_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        
-            logger.info(f"[ComfyUI] 🔄 工作流列表已更新: {len(files)} 个可用")
+            modified = False
+
+            # === 工作流列表 ===
+            if workflow_dir.exists():
+                files = sorted([
+                    f.name for f in workflow_dir.glob("*.json")
+                    if not f.name.endswith(".steps.json")
+                ])
+                if not files:
+                    files = ["workflow_api.json"]
+
+                target = data['workflow_settings']['items']['json_file']
+                target['options'] = files
+                target['enum'] = files
+                modified = True
+                logger.info(f"[ComfyUI] 🔄 工作流列表已更新: {len(files)} 个可用")
+
+            # === Persona 列表 ===
+            persona_dir = self.data_dir / 'persona'
+            if persona_dir.exists():
+                persona_files = sorted([f.name for f in persona_dir.glob("*.txt")])
+                target = data['llm_settings']['items'].get('persona_file')
+                if target:
+                    target['options'] = persona_files
+                    target['enum'] = persona_files
+                    modified = True
+                    logger.info(f"[ComfyUI] 🔄 Persona 列表已更新: {len(persona_files)} 个可用")
+
+            # === Profile 列表 ===
+            profiles_dir = self.data_dir / 'profiles'
+            if profiles_dir.exists():
+                profile_files = sorted([f.name for f in profiles_dir.glob("*.json")])
+                target = data['profile_settings']['items'].get('profile_file')
+                if target:
+                    target['options'] = profile_files
+                    target['enum'] = profile_files
+                    modified = True
+                    logger.info(f"[ComfyUI] 🔄 Profile 列表已更新: {len(profile_files)} 个可用")
+
+            if modified:
+                with open(schema_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
 
         except Exception as e:
-            logger.error(f"[ComfyUI] 更新工作流列表失败: {e}")
+            logger.error(f"[ComfyUI] 更新 UI 列表失败: {e}")
 
     # ====== 权限检查（返回原因）======
     def _check_access(self, event: AstrMessageEvent) -> tuple:
         """
         统一的权限检查，返回 (是否通过, 拒绝原因)
         """
-        user_id = str(event.get_sender_id())
-        is_admin = user_id in self.admin_user_ids
+        is_admin = self._is_admin(event)
         
         # 1. 全局锁定检查
         if self.lockdown and not is_admin:
@@ -255,7 +360,7 @@ class ComfyUIPlugin(Star):
         冷却检查，返回 (是否通过, 剩余秒数或0)
         """
         user_id = str(event.get_sender_id())
-        is_admin = user_id in self.admin_user_ids
+        is_admin = self._is_admin(event)
         
         # 管理员绕过冷却
         if is_admin and self.admin_bypass_cooldown:
@@ -277,7 +382,7 @@ class ComfyUIPlugin(Star):
         敏感词检查，返回 (是否通过, 触发的敏感词列表)
         """
         user_id = str(event.get_sender_id())
-        is_admin = user_id in self.admin_user_ids
+        is_admin = self._is_admin(event)
         
         sensitive = self._find_sensitive_words(prompt, event)
         
@@ -291,12 +396,25 @@ class ComfyUIPlugin(Star):
         
         return False, sensitive
 
+    # ====== 管理员判断（使用 AstrBot 系统管理员） ======
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        """检查用户是否为 AstrBot 全局管理员，使用 AstrBot 内置管理员系统"""
+        try:
+            return event.is_admin()
+        except AttributeError:
+            return getattr(event, 'role', None) == 'admin'
+
     @filter.on_llm_request(priority=100)
     async def inject_system_prompt(self, event: AstrMessageEvent, req):
         """注入系统提示词 + 清理历史中的绘图提示词"""
         try:
-            llm_settings = self.config.get("llm_settings", {}) 
-            my_prompt = llm_settings.get("system_prompt", "")
+            # 优先从当前 persona 文件读取
+            my_prompt = self._get_current_persona_text()
+
+            # 如果 persona 为空，回退到配置中的 system_prompt（兼容旧方式）
+            if not my_prompt:
+                llm_settings = self.config.get("llm_settings", {})
+                my_prompt = llm_settings.get("system_prompt", "")
 
             if my_prompt:
                 current_prompt = getattr(req, "system_prompt", "") or ""
@@ -353,6 +471,124 @@ class ComfyUIPlugin(Star):
             conversation.history = json.dumps(history, ensure_ascii=False)
             logger.info(f"[ComfyUI] 🗑️ 已从 conversation.history 中清理 {cleaned} 条消息的绘图提示词")
 
+    def _get_current_persona_text(self) -> str:
+        """读取当前 persona 文件的文本内容"""
+        if self.current_persona:
+            persona_path = self.persona_dir / self.current_persona
+            if persona_path.exists():
+                try:
+                    return persona_path.read_text(encoding="utf-8").strip()
+                except Exception as e:
+                    logger.warning(f"[ComfyUI] 读取 persona 文件失败: {e}")
+        return ""
+
+    # ====== Profile 辅助方法 ======
+    def _load_profile_data(self, profile_name: str) -> dict:
+        """加载指定 profile 文件的配置数据"""
+        profile_path = self.profiles_dir / profile_name
+        if not profile_path.exists():
+            return {}
+        try:
+            with open(profile_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"[ComfyUI] 读取 Profile 失败 {profile_name}: {e}")
+            return {}
+
+    def _apply_current_profile(self) -> list:
+        """将当前 profile 的配置应用到各组件，返回应用结果列表"""
+        if not self.current_profile:
+            return []
+        data = self._load_profile_data(self.current_profile)
+        if not data:
+            return [f"⚠️ Profile 文件为空或读取失败: {self.current_profile}"]
+        return self._do_apply_profile(data)
+
+    def _do_apply_profile(self, data: dict) -> list:
+        """执行 profile 配置的应用"""
+        results = []
+
+        # 1. 切换工作流 + 节点 ID
+        wf = data.get("workflow", "")
+        if wf and self.api:
+            try:
+                exists, msg = self.api.reload_config(
+                    wf,
+                    input_id=data.get("input_node_id"),
+                    output_id=data.get("output_node_id"),
+                    neg_node_id=data.get("neg_node_id"),
+                )
+                results.append(f"{'✅' if exists else '⚠️'} 工作流: {wf} ({msg.split(chr(10))[0]})")
+            except Exception as e:
+                results.append(f"❌ 工作流切换失败: {e}")
+        elif wf:
+            results.append(f"⚠️ API未初始化，跳过工作流: {wf}")
+
+        # 2. 切换 Persona
+        persona = data.get("persona", "")
+        if persona:
+            persona_path = self.persona_dir / persona
+            if persona_path.exists():
+                self.current_persona = persona
+                try:
+                    self._persona_state_file.write_text(persona, encoding="utf-8")
+                except Exception:
+                    pass
+                results.append(f"✅ Persona: {persona}")
+            else:
+                results.append(f"⚠️ Persona 文件不存在: {persona}")
+
+        return results
+
+    def _save_profile_from_config(self, name: str):
+        """从当前 WebUI 配置保存为 Profile 文件（由 save_profile_name 字段触发）"""
+        if not name.endswith(".json"):
+            name += ".json"
+
+        wf_settings = self.config.get("workflow_settings", {})
+        data = {
+            "workflow": wf_settings.get("json_file", ""),
+            "input_node_id": str(wf_settings.get("input_node_id", "")),
+            "neg_node_id": str(wf_settings.get("neg_node_id", "")),
+            "output_node_id": str(wf_settings.get("output_node_id", "")),
+            "persona": self.config.get("llm_settings", {}).get("persona_file", ""),
+        }
+
+        save_path = self.profiles_dir / name
+        try:
+            with open(save_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            self._auto_update_schema()
+            logger.info(f"[ComfyUI] 📋 已从 WebUI 保存 Profile: {name}")
+        except Exception as e:
+            logger.error(f"[ComfyUI] ❌ 从 WebUI 保存 Profile 失败: {e}")
+            return
+
+        # 尝试清除 save_profile_name 字段
+        try:
+            if isinstance(self.config, AstrBotConfig):
+                self.config["profile_settings"]["save_profile_name"] = ""
+                self.config.save_config()
+                logger.info("[ComfyUI] 📋 save_profile_name 已自动清空")
+                return
+        except Exception:
+            pass
+
+        # 备用方案：直接写配置 JSON 文件
+        try:
+            config_dir = Path.cwd() / "data" / "config"
+            config_path = config_dir / "astrbot_plugin_comfyui_pro_config.json"
+            if config_path.exists():
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                if "profile_settings" in cfg:
+                    cfg["profile_settings"]["save_profile_name"] = ""
+                    with open(config_path, 'w', encoding='utf-8') as f:
+                        json.dump(cfg, f, indent=2, ensure_ascii=False)
+                    logger.info("[ComfyUI] 📋 save_profile_name 已通过配置文件清除")
+        except Exception as e:
+            logger.debug(f"[ComfyUI] 自动清除 save_profile_name 失败（非致命）: {e}")
+
     async def initialize(self):
         self.context.activate_llm_tool("comfyui_txt2img")
         logger.info("[ComfyUI] 🎨 插件初始化完成，LLM 工具已激活")
@@ -395,7 +631,7 @@ class ComfyUIPlugin(Star):
     async def cmd_probe_send(self, event: AstrMessageEvent):
         """探测 event.send() 是否会触发 on_decorating_result"""
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if not self._is_admin(event):
             yield event.plain_result("🚫 仅管理员可用")
             return
 
@@ -422,7 +658,7 @@ class ComfyUIPlugin(Star):
         gid = self._get_group_id(event)
         policy = self._get_policy_for_event(event)
         user_id = str(event.get_sender_id())
-        is_admin = user_id in self.admin_user_ids
+        is_admin = self._is_admin(event)
         
         tips = [
             "🎨 ComfyUI Pro 插件帮助",
@@ -446,6 +682,11 @@ class ComfyUIPlugin(Star):
                 "  /comfy_save            导入新工作流",
                 "  /comfy_add             步数覆盖（按节点ID）",
                 "  /comfy_lock on|off     切换全局锁定",
+                "  /comfy_prompt_ls       列出 Persona 提示词",
+                "  /comfy_prompt_use <序号> 切换 Persona 提示词",
+                "  /comfy_profile_ls      列出配置档案",
+                "  /comfy_profile_use <序号> 一键应用配置档案",
+                "  /comfy_profile_save <名> 保存当前配置为档案",
                 "  /违禁级别              设置群敏感度",
                 ""
             ])
@@ -459,6 +700,8 @@ class ComfyUIPlugin(Star):
         if is_admin:
             tips.append(f"👑 身份：管理员")
             tips.append(f"📂 数据目录：{self.data_dir}")
+            tips.append(f"👤 当前 Persona：{self.current_persona or '无（使用配置默认值）'}")
+            tips.append(f"📋 当前 Profile：{self.current_profile or '无'}")
         
         yield event.plain_result("\n".join(tips))
     @filter.command("comfy_test_send2")
@@ -466,7 +709,7 @@ class ComfyUIPlugin(Star):
         """测试主动发送 - 第二轮"""
     
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if not self._is_admin(event):
             yield event.plain_result("🚫 仅管理员可用")
             return
     
@@ -723,7 +966,7 @@ class ComfyUIPlugin(Star):
 
         # 检查管理员权限
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if not self._is_admin(event):
             yield event.plain_result("🚫 权限不足，仅管理员可修改违禁级别")
             return
 
@@ -758,7 +1001,7 @@ class ComfyUIPlugin(Star):
     async def cmd_comfy_lock(self, event: AstrMessageEvent):
         """管理员动态切换全局锁定状态"""
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if not self._is_admin(event):
             yield event.plain_result("🚫 权限不足，仅管理员可切换全局锁定")
             return
 
@@ -797,7 +1040,7 @@ class ComfyUIPlugin(Star):
     async def cmd_comfy_list(self, event: AstrMessageEvent):
         """列出当前所有可用工作流"""
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if not self._is_admin(event):
             yield event.plain_result("🚫 权限不足，仅管理员可查看工作流列表")
             return
 
@@ -852,7 +1095,7 @@ class ComfyUIPlugin(Star):
     async def cmd_comfy_use(self, event: AstrMessageEvent):
         """切换工作流"""
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if not self._is_admin(event):
             yield event.plain_result("🚫 权限不足，仅管理员可切换工作流")
             return
 
@@ -903,11 +1146,229 @@ class ComfyUIPlugin(Star):
         logger.info(f"[ComfyUI] 管理员 {user_id} 切换工作流: {filename}")
         yield event.plain_result(f"{status} {msg}")
 
+    # ====== Persona 管理 ======
+    @filter.command("comfy_prompt_ls")
+    async def cmd_comfy_prompt_list(self, event: AstrMessageEvent):
+        """列出所有可用 Persona 提示词文件"""
+        user_id = str(event.get_sender_id())
+        if not self._is_admin(event):
+            yield event.plain_result("🚫 权限不足，仅管理员可查看 Persona 列表")
+            return
+
+        if not self.persona_dir.exists():
+            yield event.plain_result("❌ Persona 目录不存在")
+            return
+
+        files = sorted([f.name for f in self.persona_dir.glob("*.txt")])
+
+        if not files:
+            yield event.plain_result("📂 目录中没有 Persona 文件\n请将 .txt 文件放入 persona 目录")
+            return
+
+        current = self.current_persona or "无（使用配置默认值）"
+
+        msg = ["📂 Persona 提示词列表", "━━━━━━━━━━━━━━━━━━"]
+
+        for i, f in enumerate(files, 1):
+            try:
+                content = (self.persona_dir / f).read_text(encoding="utf-8")
+                first_line = content.split('\n')[0][:50] or "(空文件)"
+            except Exception:
+                first_line = "(读取失败)"
+            marker = "✅" if f == self.current_persona else "  "
+            msg.append(f"{marker} {i}. {f}  —— {first_line}")
+
+        msg.append("")
+        msg.append("━━━━━━━━━━━━━━━━━━")
+        msg.append(f"📍 当前: {current}")
+        msg.append("切换：/comfy_prompt_use <序号>")
+
+        yield event.plain_result("\n".join(msg))
+
+    @filter.command("comfy_prompt_use")
+    async def cmd_comfy_prompt_use(self, event: AstrMessageEvent):
+        """切换 Persona 提示词文件"""
+        user_id = str(event.get_sender_id())
+        if not self._is_admin(event):
+            yield event.plain_result("🚫 权限不足，仅管理员可切换 Persona")
+            return
+
+        args = event.message_str.split()
+        if len(args) < 2:
+            yield event.plain_result(
+                "❌ 参数不足\n用法：/comfy_prompt_use <序号>"
+            )
+            return
+
+        files = sorted([f.name for f in self.persona_dir.glob("*.txt")])
+        if not files:
+            yield event.plain_result("📂 目录中没有 Persona 文件")
+            return
+
+        try:
+            index = int(args[1])
+            if not (1 <= index <= len(files)):
+                yield event.plain_result(f"❌ 序号错误，请输入 1 到 {len(files)} 之间的数字")
+                return
+            filename = files[index - 1]
+        except ValueError:
+            yield event.plain_result("❌ 请输入有效的数字序号")
+            return
+
+        # 持久化当前选择
+        try:
+            self._persona_state_file.write_text(filename, encoding="utf-8")
+        except Exception as e:
+            yield event.plain_result(f"❌ 保存状态失败: {e}")
+            return
+
+        self.current_persona = filename
+        logger.info(f"[ComfyUI] 管理员 {user_id} 切换 Persona: {filename}")
+        yield event.plain_result(
+            f"✅ 已切换 Persona 为：{filename}\n"
+            f"下次 LLM 请求时生效"
+        )
+
+    # ====== Profile 管理 ======
+    @filter.command("comfy_profile_ls")
+    async def cmd_comfy_profile_list(self, event: AstrMessageEvent):
+        """列出所有配置档案 (Profile)"""
+        user_id = str(event.get_sender_id())
+        if not self._is_admin(event):
+            yield event.plain_result("🚫 权限不足，仅管理员可查看 Profile 列表")
+            return
+
+        if not self.profiles_dir.exists():
+            yield event.plain_result("❌ Profile 目录不存在")
+            return
+
+        files = sorted([f.name for f in self.profiles_dir.glob("*.json")])
+
+        if not files:
+            yield event.plain_result("📂 目录中没有 Profile 文件\n请将 .json 文件放入 profiles 目录，或使用 /comfy_profile_save 创建")
+            return
+
+        current = self.current_profile or "无"
+
+        msg = ["📂 配置档案 (Profile) 列表", "━━━━━━━━━━━━━━━━━━"]
+
+        for i, f in enumerate(files, 1):
+            data = self._load_profile_data(f)
+            wf = data.get("workflow", "?")
+            persona = data.get("persona", "?")
+            in_id = data.get("input_node_id", "?")
+            marker = "✅" if f == self.current_profile else "  "
+            msg.append(f"{marker} {i}. {f}")
+            msg.append(f"     └ 工作流: {wf} | Pos:{in_id} | Neg:{data.get('neg_node_id','?')} | Out:{data.get('output_node_id','?') or '自动'} | Persona:{persona}")
+
+        msg.append("")
+        msg.append("━━━━━━━━━━━━━━━━━━")
+        msg.append(f"📍 当前: {current}")
+        msg.append("切换：/comfy_profile_use <序号>")
+        msg.append("保存当前配置为 Profile：/comfy_profile_save <名称>")
+
+        yield event.plain_result("\n".join(msg))
+
+    @filter.command("comfy_profile_use")
+    async def cmd_comfy_profile_use(self, event: AstrMessageEvent):
+        """一键切换配置档案（工作流+节点ID+Persona）"""
+        user_id = str(event.get_sender_id())
+        if not self._is_admin(event):
+            yield event.plain_result("🚫 权限不足，仅管理员可切换 Profile")
+            return
+
+        args = event.message_str.split()
+        if len(args) < 2:
+            yield event.plain_result(
+                "❌ 参数不足\n用法：/comfy_profile_use <序号>"
+            )
+            return
+
+        files = sorted([f.name for f in self.profiles_dir.glob("*.json")])
+        if not files:
+            yield event.plain_result("📂 目录中没有 Profile 文件")
+            return
+
+        try:
+            index = int(args[1])
+            if not (1 <= index <= len(files)):
+                yield event.plain_result(f"❌ 序号错误，请输入 1 到 {len(files)} 之间的数字")
+                return
+            filename = files[index - 1]
+        except ValueError:
+            yield event.plain_result("❌ 请输入有效的数字序号")
+            return
+
+        # 加载并应用 profile
+        data = self._load_profile_data(filename)
+        if not data:
+            yield event.plain_result(f"❌ 无法读取 Profile 文件: {filename}")
+            return
+
+        results = self._do_apply_profile(data)
+
+        # 持久化
+        try:
+            self._profile_state_file.write_text(filename, encoding="utf-8")
+        except Exception as e:
+            yield event.plain_result(f"❌ 保存状态失败: {e}")
+            return
+
+        self.current_profile = filename
+        logger.info(f"[ComfyUI] 📋 管理员 {user_id} 切换 Profile: {filename}")
+
+        msg = ["✅ 已应用配置档案\n", f"📋 Profile: {filename}", "━━━━━━━━━━━━━━━━━━"]
+        msg.extend(results)
+        yield event.plain_result("\n".join(msg))
+
+    @filter.command("comfy_profile_save")
+    async def cmd_comfy_profile_save(self, event: AstrMessageEvent):
+        """将当前配置（工作流+节点ID+Persona）保存为 Profile"""
+        user_id = str(event.get_sender_id())
+        if not self._is_admin(event):
+            yield event.plain_result("🚫 权限不足，仅管理员可保存 Profile")
+            return
+
+        args = event.message_str.split()
+        if len(args) < 2:
+            yield event.plain_result(
+                "❌ 参数不足\n用法：/comfy_profile_save <名称>\n示例：/comfy_profile_save 爱丽丝-3d"
+            )
+            return
+
+        name = args[1]
+        if not name.endswith(".json"):
+            name += ".json"
+
+        # 收集当前配置
+        wf = self.api.wf_filename if self.api else ""
+        data = {
+            "workflow": wf,
+            "input_node_id": self.api.input_id if self.api else "",
+            "neg_node_id": self.api.neg_node_id if self.api else "",
+            "output_node_id": self.api.output_id if self.api else "",
+            "persona": self.current_persona or "",
+        }
+
+        save_path = self.profiles_dir / name
+        try:
+            with open(save_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            self._auto_update_schema()
+            logger.info(f"[ComfyUI] 管理员 {user_id} 保存 Profile: {name}")
+            yield event.plain_result(
+                f"✅ 已保存配置档案: {name}\n"
+                f"工作流: {wf}\n"
+                f"Persona: {self.current_persona or '无'}"
+            )
+        except Exception as e:
+            yield event.plain_result(f"❌ 保存失败: {e}")
+
     @filter.command("comfy_save")
     async def cmd_comfy_save(self, event: AstrMessageEvent):
         """保存/导入工作流"""
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if not self._is_admin(event):
             yield event.plain_result("🚫 权限不足，仅管理员可导入工作流")
             return
 
@@ -957,7 +1418,7 @@ class ComfyUIPlugin(Star):
     
         # 权限检查
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if not self._is_admin(event):
             yield event.plain_result("🚫 权限不足，仅管理员可设置步数覆盖")
             return
     
