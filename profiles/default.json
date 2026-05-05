@@ -1,0 +1,7 @@
+{
+    "workflow": "workflow_api.json",
+    "input_node_id": "6",
+    "neg_node_id": "7",
+    "output_node_id": "",
+    "persona": "default.txt"
+}
