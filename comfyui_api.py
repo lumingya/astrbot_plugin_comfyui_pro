@@ -1076,19 +1076,28 @@ class ComfyUI:
             return
 
         inputs = node.get("inputs", {})
-        target_keys = [
-            "text",
-            "opt_text",
-            "string",
-            "text_positive",
-            "positive",
-            "prompt",
-            "wildcard_text",
-        ]
-        for key in target_keys:
-            if key in inputs:
-                inputs[key] = prompt
-                break
+        if node.get("class_type") == "DanbooruTextPassthrough" and "prompt_text" in inputs:
+            inputs["prompt_text"] = prompt
+            if "use_input_text" in inputs:
+                inputs["use_input_text"] = False
+            logger.info(f"[ComfyUI] injected prompt into DanbooruTextPassthrough node {self.input_id}.prompt_text")
+        else:
+            target_keys = [
+                "text",
+                "opt_text",
+                "string",
+                "text_positive",
+                "positive",
+                "prompt",
+                "prompt_text",
+                "wildcard_text",
+            ]
+            for key in target_keys:
+                if key in inputs:
+                    inputs[key] = prompt
+                    if key == "prompt_text" and "use_input_text" in inputs:
+                        inputs["use_input_text"] = False
+                    break
 
         if self.neg_node_id and self.neg_prompt:
             neg_node = workflow.get(self.neg_node_id)

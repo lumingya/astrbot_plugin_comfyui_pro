@@ -1094,6 +1094,41 @@ class ComfyUIPlugin(Star):
         self.context.activate_llm_tool("comfyui_txt2img")
         logger.info("[ComfyUI] 🎨 插件初始化完成，LLM 工具已激活")
 
+    def _is_telegram_timeout_error(self, exc: Exception) -> bool:
+        name = exc.__class__.__name__.lower()
+        module = exc.__class__.__module__.lower()
+        text = str(exc).lower()
+        return "telegram" in module and ("timeout" in name or "timed out" in text)
+
+    async def _send_telegram_image_file(self, event: AstrMessageEvent, img_path: Path) -> None:
+        if not hasattr(event, "client"):
+            await event.send(event.chain_result([Image.fromFileSystem(str(img_path))]))
+            return
+
+        chat_id = None
+        msg_obj = getattr(event, "message_obj", None)
+        if msg_obj is not None:
+            chat_id = getattr(msg_obj, "group_id", None)
+        if not chat_id:
+            chat_id = event.get_sender_id()
+
+        message_thread_id = None
+        if isinstance(chat_id, str) and "#" in chat_id:
+            chat_id, message_thread_id = chat_id.split("#", 1)
+
+        payload = {
+            "chat_id": chat_id,
+            "photo": str(img_path),
+            "connect_timeout": 20,
+            "read_timeout": 60,
+            "write_timeout": 60,
+            "pool_timeout": 20,
+        }
+        if message_thread_id:
+            payload["message_thread_id"] = message_thread_id
+
+        await event.client.send_photo(**payload)
+
     # ====== 核心绘图逻辑 ======
     async def _handle_paint_logic(self, event: AstrMessageEvent, direct_send: bool):
         """处理画图的核心逻辑"""
@@ -2717,7 +2752,18 @@ class ComfyUIPlugin(Star):
         logger.info(f"[ComfyUI] ✅ 多图模式发送完成")
     @llm_tool(name="comfyui_txt2img")
     async def comfyui_txt2img(self, event: AstrMessageEvent, ctx: Context = None, prompt: str = None, text: str = None, img_width: int = None, img_height: int = None, direct_send: bool = False) -> MessageEventResult:
-        """ComfyUI 文生图工具"""
+        """ComfyUI 文生图工具。
+
+        Args:
+            prompt(string): Stable Diffusion / Danbooru 风格英文绘图提示词。
+            text(string): prompt 的备用字段，和 prompt 二选一即可。
+            img_width(number): 可选图片宽度。
+            img_height(number): 可选图片高度。
+            direct_send(boolean): 是否直接发送图片。
+        """
+        if not hasattr(event, "get_extra") and hasattr(event, "context"):
+            event = event.context.event
+
         draw_source = event.get_extra("comfy_draw_source") or "LLM 工具"
         
         # 权限检查
@@ -2819,19 +2865,51 @@ class ComfyUIPlugin(Star):
             logger.info(f"[ComfyUI] ✅ 图片已保存: {img_filename}")
             self._clear_draw_failures(event)
 
+            platform_name = ""
+            try:
+                platform_name = (event.get_platform_name() or "").lower()
+            except Exception:
+                platform_name = ""
+            if not direct_send and platform_name == "telegram":
+                logger.info("[ComfyUI] Telegram does not support forward Node; using direct image send")
+                direct_send = True
+
             # 发送结果
             if direct_send:
-                image_component = Image.fromFileSystem(str(img_path))
-                yield event.chain_result([image_component])
+                if platform_name == "telegram":
+                    try:
+                        await self._send_telegram_image_file(event, img_path)
+                    except Exception as send_error:
+                        if self._is_telegram_timeout_error(send_error):
+                            logger.warning(
+                                f"[ComfyUI] Telegram image send timed out after upload; treating as non-retry success: {img_filename}"
+                            )
+                            yield (
+                                "image generated; Telegram send_photo timed out while waiting for response. "
+                                f"The image may already be delivered. Do not retry automatically: {img_filename}"
+                            )
+                            return
+                        raise
+                else:
+                    image_component = Image.fromFileSystem(str(img_path))
+                    await event.send(event.chain_result([image_component]))
             else:
                 self_id = self._get_self_id(event) or "0"
                 image_component = Image.fromFileSystem(str(img_path))
+                # 部分平台 self_id 非纯数字（如 webchat 为 "webchat"），用 hash 兜底
+                try:
+                    numeric_uid = int(self_id)
+                except ValueError:
+                    numeric_uid = abs(hash(self_id)) % (10**9)
                 forward_node = Node(
-                    user_id=int(self_id),
+                    user_id=numeric_uid,
                     nickname="ComfyUI",
                     content=[image_component]
                 )
-                yield event.chain_result([forward_node])
+                await event.send(event.chain_result([forward_node]))
+
+            yield f"image generated and sent to user: {img_filename}"
+            return
 
         except Exception as e:
             logger.error(f"[ComfyUI] 执行异常: {e}")
